@@ -26,7 +26,7 @@ func main() {
 	}
 
 	mapf, reducef := loadPlugin(os.Args[1])
-	println("workder main")
+	println("workder main") 
 	mr.Worker(mapf, reducef)
 }
 
