@@ -64,7 +64,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	var wg sync.WaitGroup
 	log.Println("register begin ")
 	// 注册
-	workerId, err := Register()
+	workerId, err := WorkerDiscover()
 	log.Println("register finish, workerId: %v\n", workerId)
 
 	if err != nil {
@@ -275,7 +275,7 @@ func CallExample() {
 	}
 }
 
-func Register() (int32, error) {
+func WorkerDiscover() (int32, error) {
 	args := WorkerDiscoverArgs{}
 	reply := WorkerDiscoverReply{}
 	log.Println("register call start")
@@ -295,9 +295,9 @@ func Register() (int32, error) {
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	// sockname := coordinatorSock()
+	// c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
