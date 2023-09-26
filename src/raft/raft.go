@@ -28,6 +28,20 @@ import (
 	"6.5840/labrpc"
 )
 
+const (
+	SERVER_STATE_FOLLOWER = 0
+	SERVER_STATE_CANDIDATE = 1
+	SERVER_STATE_LEADER = 2
+)
+
+const (
+	TERM_TIMES_OUT_MILLISECONDS = 3000
+	LEADER_ELECTION_TIMES_OUT_MILLISECONDS = 500
+	CLUSTER_SERVER_NUMBERS = 5
+)
+
+
+
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
