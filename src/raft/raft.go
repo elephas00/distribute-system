@@ -89,6 +89,7 @@ type Raft struct {
 	volatileState         VolatileState
 	volatileLeaderState   VolatileLeaderState
 	volatileFollowerState VolatileFollowerState
+	applyCh 			  chan ApplyMsg
 }
 
 type VolatileFollowerState struct {
@@ -102,7 +103,7 @@ type VolatileLeaderState struct {
 
 type VolatileState struct {
 	commitIndex int
-	lastApplid  int
+	lastApplied  int
 }
 
 type PersistentState struct {
@@ -116,6 +117,7 @@ type Term struct {
 
 type Log struct {
 	Term int
+	Command interface{}
 }
 
 type AppendEntriesArgs struct {
@@ -218,12 +220,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	reply.Term = rf.persistState.term
-	if rf.persistState.term >= args.Term {
+	if rf.persistState.term > args.Term {
 		reply.VoteGranted = false
 		reply.Term = rf.persistState.term
-		// log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d)", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
-	} else if rf.persistState.logs[len(rf.persistState.logs) - 1].Term > args.LastLogTerm || (rf.persistState.logs[len(rf.persistState.logs) - 1].Term == args.LastLogTerm && len(rf.persistState.logs) > args.LastLogIndex) {
+		// log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate's term not large than current server", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
+	}else if rf.persistState.term == args.Term && rf.persistState.votedFor != NO_LEADER{
+		reply.VoteGranted = false
+		reply.Term = rf.persistState.term
+	} else if rf.persistState.logs[len(rf.persistState.logs) - 1].Term > args.LastLogTerm || (rf.persistState.logs[len(rf.persistState.logs) - 1].Term == args.LastLogTerm && len(rf.persistState.logs) - 1 > args.LastLogIndex) {
 		// candidate is not at least-up-to-date
+		// log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate is not up to date", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
+	
 		reply.VoteGranted = false
 		reply.Term = rf.persistState.term
 	} else {
@@ -233,7 +240,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persistState.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		// log.Printf("server %d (term %d, %s) vote candidate %d (term %d)", rf.me, rf.persistState.term, serverStates[rf.serverState],args.CandidateId, args.Term)
-
+	}
+	if args.Term > rf.persistState.term {
+		rf.serverState = SERVER_STATE_FOLLOWER
+		rf.persistState.term = args.Term
+		rf.persistState.votedFor = NO_LEADER
 	}
 	rf.mu.Unlock()
 
@@ -242,13 +253,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	// inconsistent := false
 	logSize := len(rf.persistState.logs)
 	if args.Term < rf.persistState.term {
 		// log.Printf("server %d (term %d) reject leader %d (term %d) heartbeat,  \n", rf.me, rf.persistState.term, args.LeaderId, args.Term)
 		reply.Success = false
-	} else if logSize < args.PrevLogIndex + 1 || rf.persistState.logs[args.PrevLogIndex].Term != args.Term {
+	} else if logSize < args.PrevLogIndex + 1 || rf.persistState.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// the index of log entries are not match current follower, just receive heart beat, but reject log
 		reply.Success = false
+		rf.persistState.term = args.Term
+		rf.volatileFollowerState.previosuHeartBeat = time.Now()
+		rf.leader = args.LeaderId
+		rf.serverState = SERVER_STATE_FOLLOWER
+		// log.Printf("server %d (term %d) logs: %v, reject heart beat %+v  \n", rf.me, rf.persistState.term, rf.persistState.logs, args)
+		// inconsistent = true
 	} else {
 		// log.Printf("server %d (term %d) receive leader %d (term %d) heartbeat \n", rf.me, rf.persistState.term, args.LeaderId, args.Term)
 		
@@ -258,28 +276,73 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.volatileFollowerState.previosuHeartBeat = time.Now()
 		rf.leader = args.LeaderId
 		rf.serverState = SERVER_STATE_FOLLOWER
-		// update log
-		if logSize == args.PrevLogIndex + 1 {
-			rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
-		}else {
-			newLogsNum := len(args.Entries)
-			appendLogsNum := args.PrevLogIndex + 1 + newLogsNum - logSize
-			overrideLogsNum := newLogsNum - appendLogsNum
-			insertCount := 0
+		
+		// there are new logs to receive
+		if len(args.Entries) > 0{
+			// update log
+			// override
+			if logSize > args.PrevLogIndex + 1 {
+				rf.persistState.logs[args.PrevLogIndex + 1] = args.Entries[0]	
+			} else {
+				rf.persistState.logs = append(rf.persistState.logs, args.Entries[0])
+			}
+
+			// newLogsNum := len(args.Entries)
+			// appendLogsNum := args.PrevLogIndex + 1 + newLogsNum - logSize
+			// overrideLogsNum := newLogsNum - appendLogsNum
+			// insertCount := 0
 			// override logs
-			for i := 0; i < overrideLogsNum; i++ {
-				rf.persistState.logs[args.PrevLogIndex + 1 + insertCount] = args.Entries[insertCount]
-				insertCount++
+			// for i := 0; i < overrideLogsNum; i++ {
+			// 	rf.persistState.logs[args.PrevLogIndex + 1 + insertCount] = args.Entries[insertCount]
+			// 	insertCount++
+			// }
+			// for i := 0; i < appendLogsNum; i++ {
+			// 	rf.persistState.logs = append(rf.persistState.logs, args.Entries[insertCount])
+			// 	insertCount++
+			// }
+			// if insertCount > 0 {
+			// 	log.Printf("follower %d (term %d) receive a new Log from index %d, detail: %v \n", rf.me, rf.persistState.term, len(rf.persistState.logs) - 1, args.Entries)
+			// }		
+		}
+
+		// newLogSize := len(rf.persistState.logs)
+		oldCommitIndex := rf.volatileState.commitIndex
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		if args.LeaderCommit > oldCommitIndex {
+			// apply committed logs to state machine
+			var min int
+			if args.LeaderCommit > lastNewEntryIndex {
+				min = lastNewEntryIndex
+			}else {
+				min = args.LeaderCommit
 			}
-			for i := 0; i < appendLogsNum; i++ {
-				rf.persistState.logs = append(rf.persistState.logs, args.Entries[insertCount])
-				insertCount++
+			
+			if min > oldCommitIndex {
+				rf.volatileState.commitIndex = min
+				go rf.applyMsg()
 			}
-			if args.LeaderCommit > rf.volatileState.commitIndex {
-				rf.volatileState.commitIndex = args.LeaderCommit
-			}
-		} 
+			// log.Printf("follower %d (term %d) commit at %d, min: %d, leaderCommit %d\n", rf.me, rf.persistState.term, rf.volatileState.commitIndex, min, args.LeaderCommit)
+		}
+		
+		// log.Printf("follower %d (term %d) commit at %d, log size: %d, leaderCommit %d\n", rf.me, rf.persistState.term, oldCommitIndex, len(rf.persistState.logs), args.LeaderCommit)
+		
+		// log.Printf("follower %d (term %d) commit at %d, min: %d, leaderCommit %d\n", rf.me, rf.persistState.term, rf.volatileState.commitIndex, min, args.LeaderCommit)
+		
+		// log.Printf("follower %d (term %d) commit index now at %d\n", rf.me, rf.persistState.term, rf.volatileState.commitIndex)
+	
 	}
+
+	if args.Term > rf.persistState.term {
+		rf.serverState = SERVER_STATE_FOLLOWER
+		rf.persistState.term = args.Term
+		rf.persistState.votedFor = NO_LEADER
+	}
+	// if inconsistent {
+	// 	log.Printf("follower %d (term %d), commit at %d, logs: %v, args :%+v\n", rf.me, rf.persistState.term, rf.volatileState.commitIndex, rf.persistState.logs, args)
+	// }
+	// if !reply.Success {
+	// 	log.Printf("follower %d (term %d) reject a new Log from index %d, detail: %v \n", rf.me, rf.persistState.term, len(rf.persistState.logs) - 1, args.Entries)		
+	// }
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -332,19 +395,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	// Your code here (2B).
-	if rf.serverState != SERVER_STATE_LEADER {
-		isLeader = false
-	}else {
+	if rf.serverState == SERVER_STATE_LEADER {
 		term = rf.persistState.term
 		index = len(rf.persistState.logs)
 		newLog := Log{
 			Term: term,
+			Command: command,
 		}
 		rf.persistState.logs = append(rf.persistState.logs, newLog)
+		// log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, len(rf.persistState.logs) - 1, newLog)
+	}else {
+		isLeader = false
 	}
-
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -371,34 +435,54 @@ func (rf *Raft) callSendRequestVote() {
 	rf.mu.Lock()
 	rf.persistState.term++
 	rf.volatileFollowerState.previosuHeartBeat = time.Now()
-	peerNum := len(rf.peers)
+	peersNum := len(rf.peers)
+	term := rf.persistState.term
+	me := rf.me
+	lastLogIndex := len(rf.persistState.logs) - 1
+	lastLogTerm := rf.persistState.logs[lastLogIndex].Term
 	rf.mu.Unlock()
 
 	// vote the server it self.
 	getVotes := 1
 	heartBeatSended := false
-	for i := 0; i < peerNum; i++ {
-		if i == rf.me {
+	for i := 0; i < peersNum; i++ {
+		if i == me {
 			continue
 		}
 		go func(server int) {
 			args := RequestVoteArgs{
-				Term:        rf.persistState.term,
-				CandidateId: rf.me,
+				Term:        term,
+				CandidateId: me,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm: lastLogTerm,
 			}
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(server, &args, &reply)
 			// log.Printf("server %d (term %d, %s) received vote from server %d (term %d), result is %v", rf.me, rf.persistState.term, serverStates[rf.serverState], server, reply.Term, reply.VoteGranted)
 			rf.mu.Lock()
-			if reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
+			if reply.Term > rf.persistState.term {
+				rf.persistState.term = reply.Term
+				rf.serverState = SERVER_STATE_FOLLOWER
+				rf.persistState.votedFor = NO_LEADER
+			}else if reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
 				getVotes++
-				if getVotes > peerNum/2 && !heartBeatSended {
+				if getVotes > peersNum/2 && !heartBeatSended {
 					// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, getVotes, rf.persistState.term)
-					if rf.serverState == SERVER_STATE_CANDIDATE {
-						rf.serverState = SERVER_STATE_LEADER
-						rf.sendAppendEntriesToFollowers()
-						heartBeatSended = true
+					rf.serverState = SERVER_STATE_LEADER
+					heartBeatSended = true
+					logsNum := lastLogIndex + 1
+					// initialize volatile leader info
+					rf.volatileLeaderState.nextIndex = make([]int, peersNum)
+					rf.volatileLeaderState.matchIndex = make([]int, peersNum)
+					for idx := 0; idx < peersNum; idx++ {
+						rf.volatileLeaderState.nextIndex[idx] = logsNum
+						rf.volatileLeaderState.matchIndex[idx] = 0
 					}
+					// send heart beat to followers
+					go func() {
+						rf.sendAppendEntriesToFollowers()
+					}()
+					
 				}
 			}
 			rf.mu.Unlock()
@@ -407,26 +491,122 @@ func (rf *Raft) callSendRequestVote() {
 
 }
 
+func (rf *Raft) processAppendEntriesSuccessReply(args *AppendEntriesArgs, reply *AppendEntriesReply, server int){
+	prevLogIndex := args.PrevLogIndex
+	peersNum := len(rf.peers)
+	
+	matchIndex := prevLogIndex + len(args.Entries)
+	if matchIndex > rf.volatileLeaderState.matchIndex[server] {
+		rf.volatileLeaderState.nextIndex[server] = matchIndex + 1
+		rf.volatileLeaderState.matchIndex[server] = matchIndex
+	}
+	// update commits
+	oldCommitIndex := rf.volatileState.commitIndex
+	for commitIndex := matchIndex; commitIndex > oldCommitIndex; commitIndex-- {
+		// a leader can only commit logs in its term
+		if rf.persistState.logs[commitIndex].Term != rf.persistState.term {
+			break
+		}
+		// the log at least exists in the leader
+		cnt := 1
+		for _, matchIdx := range rf.volatileLeaderState.matchIndex {
+			if matchIdx >= commitIndex {
+				cnt++
+			}
+		}
+		if cnt > peersNum / 2 {
+			// log.Printf("%d committed in leader %d (term %d), count is %d\n ", commitIndex, rf.me, rf.persistState.term, cnt)
+			rf.volatileState.commitIndex = commitIndex
+			// apply commited logs to state machine
+		 	go rf.applyMsg()
+		}
+	}
+}
+
+func (rf *Raft) applyMsg(){
+	rf.mu.Lock()
+	lastApplied := rf.volatileState.lastApplied
+	commitIndex := rf.volatileState.commitIndex
+	for pos:= lastApplied; pos <= commitIndex; pos++ {
+		msg := ApplyMsg{
+			Command: rf.persistState.logs[pos].Command,
+			CommandIndex: pos,
+			CommandValid: true,
+		}	
+		rf.applyCh <- msg
+		rf.volatileState.lastApplied = pos
+		// log.Printf("server %d (term %d) commit {index:%d}, commitIndex: %v\n", rf.me, rf.persistState.term, msg.CommandIndex, rf.volatileState.commitIndex)
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int){
+	lastLogIdx := len(rf.persistState.logs) - 1
+	nextIdx := rf.volatileLeaderState.nextIndex[server]
+	
+	args.LeaderId = rf.me
+	args.LeaderCommit = rf.volatileState.commitIndex
+	args.Term = rf.persistState.term
+	
+	if nextIdx > lastLogIdx {
+		// heart beat, send empty log entry
+		args.PrevLogIndex = lastLogIdx
+		args.PrevLogTerm = rf.persistState.logs[lastLogIdx].Term
+		args.Entries = []Log{}
+		
+		// log.Printf("branch1, next index %d, last log index %d, leader logs: %v, args: %+v\n",nextIdx, lastLogIdx, rf.persistState.logs, args)
+	}else {
+		// there are new logs send to followers
+		prevLogIndex := nextIdx - 1
+		args.PrevLogIndex = prevLogIndex
+		args.PrevLogTerm = rf.persistState.logs[prevLogIndex].Term
+		entries := make([]Log, 1)
+		entries[0] = rf.persistState.logs[nextIdx]
+		args.Entries = entries		
+		// log.Printf("branch2 next index %d, last log index %d, leader logs: %v, args: %+v\n",nextIdx, lastLogIdx, rf.persistState.logs, args)
+	}
+}
+
 func (rf *Raft) sendAppendEntriesToFollowers() {
-	peerNum := len(rf.peers)
+	rf.mu.Lock()
+	peersNum := len(rf.peers)
+	me := rf.me
+	rf.mu.Unlock()
+	
 	// respNum := 0
-	for i := 0; i < peerNum; i++ {
+	for i := 0; i < peersNum; i++ {
 		// send heart beats.
-		if i == rf.me {
+		if i == me {
 			continue
 		}
 		go func(server int) {
-			rf.mu.Lock()
-			args := AppendEntriesArgs{
-				Term:     rf.persistState.term,
-				LeaderId: rf.me,
-			}
-			rf.mu.Unlock()
+			// if last log index >= nextIndex, do below
+			args := AppendEntriesArgs{}
 			reply := AppendEntriesReply{}
+			
+			rf.mu.Lock()	
+			rf.prepareAppendEntriesArgs(&args, server)
+			rf.mu.Unlock()
+			// log.Printf("leader %d (term %d, commit %d) send append entries to server %d \n", args.LeaderId, args.Term, args.LeaderCommit, server)
 			rf.sendAppendEntries(server, &args, &reply)
-			// if reply.Success {
-			// 	respNum++
-			// }
+			
+			// process response
+			rf.mu.Lock()
+			if reply.Term > rf.persistState.term {
+				rf.persistState.term = reply.Term
+				rf.serverState = SERVER_STATE_FOLLOWER
+				rf.persistState.votedFor = NO_LEADER
+				rf.mu.Unlock()
+			}else if reply.Success {
+				rf.processAppendEntriesSuccessReply(&args, &reply, server)
+			}else {
+				// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
+				if rf.volatileLeaderState.nextIndex[server] > 1 {
+					rf.volatileLeaderState.nextIndex[server]--
+				}
+			}		
+			rf.mu.Unlock()
+			// log.Printf("retry\n")
 		}(i)
 	}
 	// log.Printf("server %d (term %d) heart beat, receive %d responds\n", rf.me, rf.persistState.term, respNum)
@@ -460,7 +640,9 @@ func (rf *Raft) ticker() {
 		}
 		rf.mu.Lock()
 		if rf.serverState == SERVER_STATE_LEADER {
-			rf.sendAppendEntriesToFollowers()
+			go func ()  {
+				rf.sendAppendEntriesToFollowers()
+			}()
 		} else {
 			if rf.serverState == SERVER_STATE_CANDIDATE {
 				// log.Printf("server %d (term %d, %s) time out and found no leader in this term, new vote begin", rf.me, rf.persistState.term, serverStates[rf.serverState])
@@ -503,6 +685,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
 	rf.leader = NO_LEADER
 	rf.serverState = SERVER_STATE_FOLLOWER
 	followerState := VolatileFollowerState{}
@@ -513,6 +696,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persistState = persistentState
 	leaderState := VolatileLeaderState{}
 	rf.volatileLeaderState = leaderState
+	// initialize logs
+	sentienl := Log{Term: 0}
+	rf.persistState.logs = []Log{sentienl}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
