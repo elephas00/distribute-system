@@ -19,8 +19,10 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -434,61 +436,75 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) callSendRequestVote() {
 	rf.mu.Lock()
 	rf.persistState.term++
-	rf.volatileFollowerState.previosuHeartBeat = time.Now()
-	peersNum := len(rf.peers)
 	term := rf.persistState.term
-	me := rf.me
-	lastLogIndex := len(rf.persistState.logs) - 1
-	lastLogTerm := rf.persistState.logs[lastLogIndex].Term
 	rf.mu.Unlock()
 
 	// vote the server it self.
 	getVotes := 1
 	heartBeatSended := false
-	for i := 0; i < peersNum; i++ {
-		if i == me {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
 			continue
 		}
-		go func(server int) {
-			args := RequestVoteArgs{
-				Term:        term,
-				CandidateId: me,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm: lastLogTerm,
-			}
-			reply := RequestVoteReply{}
-			rf.sendRequestVote(server, &args, &reply)
-			// log.Printf("server %d (term %d, %s) received vote from server %d (term %d), result is %v", rf.me, rf.persistState.term, serverStates[rf.serverState], server, reply.Term, reply.VoteGranted)
-			rf.mu.Lock()
-			if reply.Term > rf.persistState.term {
-				rf.persistState.term = reply.Term
-				rf.serverState = SERVER_STATE_FOLLOWER
-				rf.persistState.votedFor = NO_LEADER
-			}else if reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
-				getVotes++
-				if getVotes > peersNum/2 && !heartBeatSended {
-					// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, getVotes, rf.persistState.term)
-					rf.serverState = SERVER_STATE_LEADER
-					heartBeatSended = true
-					logsNum := lastLogIndex + 1
-					// initialize volatile leader info
-					rf.volatileLeaderState.nextIndex = make([]int, peersNum)
-					rf.volatileLeaderState.matchIndex = make([]int, peersNum)
-					for idx := 0; idx < peersNum; idx++ {
-						rf.volatileLeaderState.nextIndex[idx] = logsNum
-						rf.volatileLeaderState.matchIndex[idx] = 0
-					}
-					// send heart beat to followers
-					go func() {
-						rf.sendAppendEntriesToFollowers()
-					}()
-					
-				}
-			}
-			rf.mu.Unlock()
-		}(i)
+		go rf.doRequestVote(i, &getVotes, &heartBeatSended, term)
 	}
 
+}
+
+func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, term int){
+	rf.mu.Lock()
+	if rf.persistState.term != term {
+		rf.mu.Unlock()
+		return
+	}
+	peersNum := len(rf.peers)
+	lastLogIndex := len(rf.persistState.logs) - 1
+	lastLogTerm := rf.persistState.logs[lastLogIndex].Term
+	args := RequestVoteArgs{
+		Term:        term,
+		CandidateId: rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm: lastLogTerm,
+	}
+	reply := RequestVoteReply{}
+	rf.mu.Unlock()
+
+	ok := rf.sendRequestVote(server, &args, &reply)
+	if !ok {
+		return
+	}
+	// log.Printf("server %d (term %d, %s) received vote from server %d (term %d), result is %v", rf.me, rf.persistState.term, serverStates[rf.serverState], server, reply.Term, reply.VoteGranted)
+	rf.mu.Lock()
+	
+	if reply.Term > rf.persistState.term {
+		rf.persistState.term = reply.Term
+		rf.serverState = SERVER_STATE_FOLLOWER
+		rf.persistState.votedFor = NO_LEADER
+		rf.mu.Unlock()
+		return
+	}
+
+	if term == rf.persistState.term && reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
+		*getVotes = (*getVotes + 1)
+		if *getVotes >  peersNum/2 && !*heartBeatSended {
+			// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, getVotes, rf.persistState.term)
+			rf.serverState = SERVER_STATE_LEADER
+			*heartBeatSended = true
+			logsNum := lastLogIndex + 1
+			// initialize volatile leader info
+			rf.volatileLeaderState.nextIndex = make([]int, peersNum)
+			rf.volatileLeaderState.matchIndex = make([]int, peersNum)
+			for idx := 0; idx < peersNum; idx++ {
+				rf.volatileLeaderState.nextIndex[idx] = logsNum
+				rf.volatileLeaderState.matchIndex[idx] = 0
+			}
+			// send heart beat to followers
+			go func() {
+				rf.sendAppendEntriesToFollowers()
+			}()
+		}
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) processAppendEntriesSuccessReply(args *AppendEntriesArgs, reply *AppendEntriesReply, server int){
@@ -524,6 +540,7 @@ func (rf *Raft) processAppendEntriesSuccessReply(args *AppendEntriesArgs, reply 
 }
 
 func (rf *Raft) applyMsg(){
+	
 	rf.mu.Lock()
 	lastApplied := rf.volatileState.lastApplied
 	commitIndex := rf.volatileState.commitIndex
@@ -568,49 +585,50 @@ func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int){
 }
 
 func (rf *Raft) sendAppendEntriesToFollowers() {
-	rf.mu.Lock()
 	peersNum := len(rf.peers)
-	me := rf.me
-	rf.mu.Unlock()
-	
+	me := rf.me	
+
 	// respNum := 0
 	for i := 0; i < peersNum; i++ {
 		// send heart beats.
 		if i == me {
 			continue
 		}
-		go func(server int) {
-			// if last log index >= nextIndex, do below
-			args := AppendEntriesArgs{}
-			reply := AppendEntriesReply{}
-			
-			rf.mu.Lock()	
-			rf.prepareAppendEntriesArgs(&args, server)
-			rf.mu.Unlock()
-			// log.Printf("leader %d (term %d, commit %d) send append entries to server %d \n", args.LeaderId, args.Term, args.LeaderCommit, server)
-			rf.sendAppendEntries(server, &args, &reply)
-			
-			// process response
-			rf.mu.Lock()
-			if reply.Term > rf.persistState.term {
-				rf.persistState.term = reply.Term
-				rf.serverState = SERVER_STATE_FOLLOWER
-				rf.persistState.votedFor = NO_LEADER
-				rf.mu.Unlock()
-			}else if reply.Success {
-				rf.processAppendEntriesSuccessReply(&args, &reply, server)
-			}else {
-				// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
-				if rf.volatileLeaderState.nextIndex[server] > 1 {
-					rf.volatileLeaderState.nextIndex[server]--
-				}
-			}		
-			rf.mu.Unlock()
-			// log.Printf("retry\n")
-		}(i)
+		go rf.doAppendEntries(i)
 	}
 	// log.Printf("server %d (term %d) heart beat, receive %d responds\n", rf.me, rf.persistState.term, respNum)
 
+}
+
+func (rf *Raft) doAppendEntries(server int) {
+	// if last log index >= nextIndex, do below
+	args := AppendEntriesArgs{}
+	reply := AppendEntriesReply{}
+	
+	rf.mu.Lock()	
+	rf.prepareAppendEntriesArgs(&args, server)
+	rf.mu.Unlock()
+	// log.Printf("leader %d (term %d, commit %d) send append entries to server %d \n", args.LeaderId, args.Term, args.LeaderCommit, server)
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	if !ok {
+		return
+	}
+	// process response
+	rf.mu.Lock()
+	if reply.Term > rf.persistState.term {
+		rf.persistState.term = reply.Term
+		rf.serverState = SERVER_STATE_FOLLOWER
+		rf.persistState.votedFor = NO_LEADER
+	}else if rf.persistState.term == args.Term && reply.Success {
+		rf.processAppendEntriesSuccessReply(&args, &reply, server)
+	}else {
+		// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
+		if rf.volatileLeaderState.nextIndex[server] > 1 {
+			rf.volatileLeaderState.nextIndex[server]--
+		}
+	}		
+	rf.mu.Unlock()
+	// log.Printf("retry\n")
 }
 
 func (rf *Raft) ticker() {
@@ -723,4 +741,25 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// log.Printf("send append entries called server:%d, total server num: %d \n", server, n)
 	ok := rf.peers[server].Call("Raft.AppendEntires", args, reply)
 	return ok
+}
+
+
+
+func (rf *Raft) printCommitLogs() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	p := "%s %d (term: %d), commited logs: ["
+	message := fmt.Sprintf(p, serverStates[rf.serverState], rf.me, rf.persistState.term)
+	var builder strings.Builder
+	builder.WriteString(message)
+	logPattern := "%d:%d"
+	for i := 0; i <= rf.volatileState.commitIndex; i++ {
+		log := rf.persistState.logs[i]
+		if i != 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(fmt.Sprintf(logPattern, i, log.Term))
+	}
+	builder.WriteString("]")
+	log.Println(builder.String())
 }
