@@ -84,7 +84,7 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex         // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -240,12 +240,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < term {
 		reply.VoteGranted = false
-		// log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate's term not large than current server", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
+		log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate's term not large than current server", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
 	} else if rf.persistState.term == args.Term && rf.persistState.votedFor != NO_LEADER {
 		reply.VoteGranted = false
 	} else if rf.persistState.logs[len(rf.persistState.logs)-1].Term > args.LastLogTerm || (rf.persistState.logs[len(rf.persistState.logs)-1].Term == args.LastLogTerm && len(rf.persistState.logs)-1 > args.LastLogIndex) {
 		// candidate is not at least-up-to-date
-		// log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate is not up to date", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
+		log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate is not up to date", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
 		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
@@ -253,7 +253,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.volatileFollowerState.previosuHeartBeat = time.Now()
 		rf.persistState.term = args.Term
 		rf.persistState.votedFor = args.CandidateId
-		// log.Printf("server %d (term %d, %s) vote candidate %d (term %d)", rf.me, rf.persistState.term, serverStates[rf.serverState],args.CandidateId, args.Term)
+		log.Printf("server %d (term %d, %s) vote candidate %d (term %d)", rf.me, rf.persistState.term, serverStates[rf.serverState],args.CandidateId, args.Term)
 	}
 
 	rf.mu.Unlock()
@@ -294,7 +294,7 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(args.Entries) > 0 {
 			// update log
 			// override
-			rf.receiveEntries(args)
+			rf.receiveLogs(args)
 		}
 
 		// newLogSize := len(rf.persistState.logs)
@@ -325,7 +325,7 @@ func (rf *Raft) receiveEntries(args *AppendEntriesArgs) {
 }
 
 func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
-	logSize := len(args.Entries)
+	logSize := len(rf.persistState.logs)
 	if logSize > args.PrevLogIndex + 1 {
 		for pos := args.PrevLogIndex + 1; pos <= rf.volatileState.lastApplied; pos++ {
 			msg := ApplyMsg{
@@ -350,13 +350,10 @@ func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
 		}
 		rf.persistState.logs = rf.persistState.logs[0 : args.PrevLogIndex + 1]
 	}
-	rf.printCommitLogs()
+	// rf.printCommitLogs()
 	// log.Printf("%s %d, term %d, commit %d, args: %+v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex, args)
-	
-	for _, entry := range args.Entries {
-		rf.persistState.logs = append(rf.persistState.logs, entry)
-	}
-	rf.printCommitLogs()
+	rf.persistState.logs = append(rf.persistState.logs, args.Entries...)	
+	// rf.printCommitLogs()
 
 }
 
@@ -508,7 +505,7 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 	if term == rf.persistState.term && reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
 		*getVotes = (*getVotes + 1)
 		if *getVotes > peersNum/2 && !*heartBeatSended {
-			// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, getVotes, rf.persistState.term)
+			log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
 			rf.serverState = SERVER_STATE_LEADER
 			*heartBeatSended = true
 			logsNum := lastLogIndex + 1
@@ -521,6 +518,7 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 			}
 			// send heart beat to followers
 			go func() {
+				time.Sleep(FOR_LOOP_FIXED_DELAY_MILLISECONDS)
 				rf.sendAppendEntriesToFollowers()
 			}()
 		}
@@ -706,7 +704,7 @@ func (rf *Raft) ticker() {
 			}()
 		} else {
 			if rf.serverState == SERVER_STATE_CANDIDATE {
-				// log.Printf("server %d (term %d, %s) time out and found no leader in this term, new vote begin", rf.me, rf.persistState.term, serverStates[rf.serverState])
+				log.Printf("server %d (term %d, %s) time out and found no leader in this term, new vote begin", rf.me, rf.persistState.term, serverStates[rf.serverState])
 				go func() {
 					rf.callSendRequestVote()
 				}()
@@ -715,7 +713,7 @@ func (rf *Raft) ticker() {
 
 				} else {
 					rf.serverState = SERVER_STATE_CANDIDATE
-					// log.Printf("server %d (term %d, %s) time out, vote begin, previous heatbeat at %v  \n", rf.me, rf.persistState.term, serverStates[rf.serverState], rf.volatileFollowerState.previosuHeartBeat)
+					log.Printf("server %d (term %d, %s) time out, vote begin, previous heatbeat at %v  \n", rf.me, rf.persistState.term, serverStates[rf.serverState], rf.volatileFollowerState.previosuHeartBeat)
 					go func() {
 						rf.callSendRequestVote()
 					}()
