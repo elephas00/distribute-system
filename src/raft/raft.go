@@ -283,12 +283,32 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(args.Entries) > 0{
 			// update log
 			// override
-			if logSize > args.PrevLogIndex + 1 {
-				rf.persistState.logs[args.PrevLogIndex + 1] = args.Entries[0]	
-			} else {
-				rf.persistState.logs = append(rf.persistState.logs, args.Entries[0])
-			}
+			if logSize > args.PrevLogIndex+1 {
+				for pos := args.PrevLogIndex + 1; pos <= rf.volatileState.lastApplied; pos++ {
+					msg := ApplyMsg{
+						CommandValid: false,
+						CommandIndex: pos,
+						Command:      rf.persistState.logs[pos],
+					}
+					rf.applyCh <- msg
+				}
 
+				var min = rf.volatileState.lastApplied
+				if min > args.LeaderCommit {
+					min = args.LeaderCommit
+				}
+				if min > args.PrevLogIndex {
+					min = args.PrevLogIndex
+				}
+				if min != rf.volatileState.lastApplied {
+					// log.Printf("%s %d term %d, roll back triggerd, oldCommit %d, now commit　%d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex, min)
+					rf.volatileState.lastApplied = min
+					rf.volatileState.commitIndex = min
+				}
+				rf.persistState.logs = rf.persistState.logs[0 : args.PrevLogIndex + 1]
+			}
+			rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
+			
 			// newLogsNum := len(args.Entries)
 			// appendLogsNum := args.PrevLogIndex + 1 + newLogsNum - logSize
 			// overrideLogsNum := newLogsNum - appendLogsNum
@@ -321,6 +341,7 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 			
 			if min > oldCommitIndex {
 				rf.volatileState.commitIndex = min
+				// go rf.printCommitLogs()
 				go rf.applyMsg()
 			}
 			// log.Printf("follower %d (term %d) commit at %d, min: %d, leaderCommit %d\n", rf.me, rf.persistState.term, rf.volatileState.commitIndex, min, args.LeaderCommit)
@@ -407,6 +428,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		rf.persistState.logs = append(rf.persistState.logs, newLog)
 		// log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, len(rf.persistState.logs) - 1, newLog)
+		go rf.sendAppendEntriesToFollowers()
 	}else {
 		isLeader = false
 	}
@@ -533,6 +555,7 @@ func (rf *Raft) processAppendEntriesSuccessReply(args *AppendEntriesArgs, reply 
 		if cnt > peersNum / 2 {
 			// log.Printf("%d committed in leader %d (term %d), count is %d\n ", commitIndex, rf.me, rf.persistState.term, cnt)
 			rf.volatileState.commitIndex = commitIndex
+			// go rf.printCommitLogs()
 			// apply commited logs to state machine
 		 	go rf.applyMsg()
 		}
@@ -577,35 +600,44 @@ func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int){
 		prevLogIndex := nextIdx - 1
 		args.PrevLogIndex = prevLogIndex
 		args.PrevLogTerm = rf.persistState.logs[prevLogIndex].Term
-		entries := make([]Log, 1)
-		entries[0] = rf.persistState.logs[nextIdx]
+		entries := rf.persistState.logs[prevLogIndex + 1:]
 		args.Entries = entries		
 		// log.Printf("branch2 next index %d, last log index %d, leader logs: %v, args: %+v\n",nextIdx, lastLogIdx, rf.persistState.logs, args)
 	}
 }
 
 func (rf *Raft) sendAppendEntriesToFollowers() {
+	rf.mu.Lock()
+	if rf.serverState != SERVER_STATE_LEADER {
+		rf.mu.Unlock()
+		return
+	}
+	term := rf.persistState.term
 	peersNum := len(rf.peers)
 	me := rf.me	
-
+	rf.mu.Unlock()
 	// respNum := 0
 	for i := 0; i < peersNum; i++ {
 		// send heart beats.
 		if i == me {
 			continue
 		}
-		go rf.doAppendEntries(i)
+		go rf.doAppendEntries(i, term)
 	}
 	// log.Printf("server %d (term %d) heart beat, receive %d responds\n", rf.me, rf.persistState.term, respNum)
 
 }
 
-func (rf *Raft) doAppendEntries(server int) {
+func (rf *Raft) doAppendEntries(server int, term int) {
 	// if last log index >= nextIndex, do below
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 	
 	rf.mu.Lock()	
+	if rf.persistState.term != term {
+		rf.mu.Unlock()
+		return 	
+	}
 	rf.prepareAppendEntriesArgs(&args, server)
 	rf.mu.Unlock()
 	// log.Printf("leader %d (term %d, commit %d) send append entries to server %d \n", args.LeaderId, args.Term, args.LeaderCommit, server)
@@ -619,7 +651,12 @@ func (rf *Raft) doAppendEntries(server int) {
 		rf.persistState.term = reply.Term
 		rf.serverState = SERVER_STATE_FOLLOWER
 		rf.persistState.votedFor = NO_LEADER
-	}else if rf.persistState.term == args.Term && reply.Success {
+	}
+	if rf.persistState.term != term {
+		rf.mu.Unlock()
+		return
+	}
+	if rf.persistState.term == args.Term && reply.Success {
 		rf.processAppendEntriesSuccessReply(&args, &reply, server)
 	}else {
 		// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
