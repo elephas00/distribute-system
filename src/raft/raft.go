@@ -144,9 +144,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term         int  // currentTerm, for leader to update itself
-	Success      bool // true if follower contained entry matching
-	PrevLogIndex int  // and prevLogTerm
+	Term              int  // currentTerm, for leader to update itself
+	Success           bool // true if follower contained entry matching
+	MostProbableIndex int
+	MostProbableTerm  int
 }
 
 // return currentTerm and whether this server
@@ -203,7 +204,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var logs []Log
 	if d.Decode(&term) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&logs) != nil{
+		d.Decode(&logs) != nil {
 		log.Fatal("read persist failed")
 	} else {
 		rf.mu.Lock()
@@ -280,6 +281,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
+func (rf *Raft) writeMostProbableInfo(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	min := len(rf.persistState.logs) - 1
+	if min > args.PrevLogIndex-1 {
+		min = args.PrevLogIndex - 1
+	}
+	for i := min; i >= 0; i-- {
+		if rf.persistState.logs[i].Term <= args.Term {
+			reply.MostProbableIndex = i
+			for j := i - 1; j >= 0; j-- {
+				if rf.persistState.logs[j].Term == rf.persistState.logs[i].Term {
+					reply.MostProbableIndex = j
+				}
+			}
+			break
+		}
+	}
+	reply.MostProbableTerm = rf.persistState.logs[reply.MostProbableIndex].Term
+}
+
 func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	rf.mu.Lock()
@@ -306,6 +326,7 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.leader = args.LeaderId
 		rf.serverState = SERVER_STATE_FOLLOWER
 		// log.Printf("server %d (term %d) logs: %v, reject heart beat %+v  \n", rf.me, rf.persistState.term, rf.persistState.logs, args)
+		rf.writeMostProbableInfo(args, reply)
 	} else {
 		reply.Success = true
 		// update state
@@ -438,18 +459,17 @@ func (rf *Raft) receiveEntries(args *AppendEntriesArgs) {
 	}
 }
 
-
 func (rf *Raft) noConflicts(args *AppendEntriesArgs) bool {
 	if rf.volatileState.lastApplied <= args.PrevLogIndex {
 		return true
 	}
 	lastLogIndex := len(rf.persistState.logs)
 	argsLastIndex := len(args.Entries)
-	for i, j := args.PrevLogIndex + 1, 0; i <= lastLogIndex && i <= rf.volatileState.lastApplied && j <= argsLastIndex; {
+	for i, j := args.PrevLogIndex+1, 0; i <= lastLogIndex && i <= rf.volatileState.lastApplied && j <= argsLastIndex; {
 		if rf.persistState.logs[i].Term != args.Entries[j].Term {
 			return false
 		}
-  		i++
+		i++
 		j++
 	}
 	return true
@@ -460,12 +480,12 @@ func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
 	// if rf.volatileState.commitIndex >= newLatestIndex {
 	// 	return
 	// }
-	
+
 	// there are some conflicts
 	logSize := len(rf.persistState.logs)
 	if rf.noConflicts(args) {
 		rf.persistState.logs = rf.persistState.logs[0 : args.PrevLogIndex+1]
-	}else if logSize > args.PrevLogIndex+1 {
+	} else if logSize > args.PrevLogIndex+1 {
 		for pos := args.PrevLogIndex + 1; pos <= rf.volatileState.lastApplied; pos++ {
 			msg := ApplyMsg{
 				CommandValid: false,
@@ -815,16 +835,34 @@ func (rf *Raft) doAppendEntries(server int, term int) {
 		rf.processAppendEntriesSuccessReply(&args, &reply, server)
 	} else {
 		// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
-		diff := rf.volatileLeaderState.nextIndex[server] - rf.volatileLeaderState.matchIndex[server]
-		if diff > 10 {
-			delta := diff / 5
-			rf.volatileLeaderState.nextIndex[server] -= delta
-		} else if rf.volatileLeaderState.nextIndex[server] > 1 {
-			rf.volatileLeaderState.nextIndex[server]--
-		}
+		rf.handleAppendEntriesFailure(&reply, server)
 	}
 	rf.mu.Unlock()
 	// log.Printf("retry\n")
+}
+
+func (rf *Raft) handleAppendEntriesFailure(reply *AppendEntriesReply, server int) {
+	min := len(rf.persistState.logs) - 1
+	if reply.MostProbableIndex < min {
+		min = reply.MostProbableIndex
+	}
+	if rf.volatileLeaderState.nextIndex[server]-1 < min {
+		min = rf.volatileLeaderState.nextIndex[server] - 1
+	}
+	if min > 0 {
+		rf.volatileLeaderState.nextIndex[server] = min
+	}
+	for i := min; i > rf.volatileLeaderState.matchIndex[server]; i-- {
+		if rf.persistState.logs[i].Term <= reply.MostProbableTerm {
+			rf.volatileLeaderState.nextIndex[server] = i
+			for j := min - 1; j > rf.volatileLeaderState.matchIndex[server]; j-- {
+				if rf.persistState.logs[j].Term == rf.persistState.logs[i].Term {
+					rf.volatileLeaderState.nextIndex[server] = j
+				}
+			}
+			break
+		}
+	}
 }
 
 func (rf *Raft) ticker() {
