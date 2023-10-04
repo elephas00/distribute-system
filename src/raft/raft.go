@@ -314,18 +314,109 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			if min > oldCommitIndex {
 				rf.volatileState.commitIndex = min
+				rf.printCommitLogs()
 				go rf.applyMsg()
 			}
+			 	
 		}
 	}
 }
 
+
+// deprecated, some bugs here.
 func (rf *Raft) receiveEntries(args *AppendEntriesArgs) {
 	lastLogIndex := len(rf.persistState.logs) - 1
-	if lastLogIndex > args.PrevLogIndex {
-		rf.persistState.logs = rf.persistState.logs[0: args.PrevLogIndex + 1]
+	newEntriesSize := len(args.Entries)
+	lastLogIndexAfterMerge := args.PrevLogIndex + newEntriesSize 
+	// roll back applied logs
+	if rf.volatileState.lastApplied > args.LeaderCommit {
+		for i := args.LeaderCommit + 1; i <= rf.volatileState.lastApplied && i <= lastLogIndex; i++ {
+			msg := ApplyMsg{
+				CommandValid: false,
+				CommandIndex: i,
+				Command:      rf.persistState.logs[i],
+			}
+			rf.applyCh <- msg
+		}
+		rf.volatileState.lastApplied = args.LeaderCommit
+		rf.volatileState.commitIndex = args.LeaderCommit
 	}
-	rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
+
+	if lastLogIndex >= lastLogIndexAfterMerge {
+		firstNotMatchIndex := -1
+		for i, j := lastLogIndexAfterMerge, newEntriesSize - 1; i > args.PrevLogIndex;  {
+			
+			if rf.persistState.logs[i].Term != args.Entries[j].Term {
+				firstNotMatchIndex = i
+				
+			}			
+			i--
+			j--
+		}
+		if firstNotMatchIndex != -1 && firstNotMatchIndex <= rf.volatileState.commitIndex {
+			rf.volatileState.commitIndex = firstNotMatchIndex - 1
+		}
+		if firstNotMatchIndex != -1 && firstNotMatchIndex <= rf.volatileState.lastApplied {
+			rf.volatileState.lastApplied = firstNotMatchIndex - 1
+		}
+		for i, j := args.PrevLogIndex + 1, 0; j < newEntriesSize;  {
+			rf.persistState.logs[i] = args.Entries[j]
+			i++
+			j++
+		}
+	} else {
+		firstNotMatchIndex := -1
+		for i, j := lastLogIndex, lastLogIndex - args.PrevLogIndex - 1; j >= 0; {
+			if rf.persistState.logs[i].Term != args.Entries[j].Term {
+				firstNotMatchIndex = i
+				msg := ApplyMsg{
+					CommandValid: false,
+					CommandIndex: i,
+					Command:      rf.persistState.logs[i],
+				}
+				rf.applyCh <- msg
+			}			
+			i--
+			j--
+		} 	
+		if firstNotMatchIndex != -1 && firstNotMatchIndex <= rf.volatileState.commitIndex {
+			rf.volatileState.commitIndex = firstNotMatchIndex - 1
+		}
+		if firstNotMatchIndex != -1 && firstNotMatchIndex <= rf.volatileState.lastApplied {
+			rf.volatileState.lastApplied = firstNotMatchIndex - 1
+		}
+		rf.persistState.logs = rf.persistState.logs[0 : args.PrevLogIndex + 1]
+		rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
+	}
+	
+	
+	if lastLogIndex > args.PrevLogIndex {
+		cnt := 0
+		for i := args.PrevLogIndex + 1 ; i < lastLogIndex && cnt < newEntriesSize ; i++{
+			if rf.persistState.logs[i].Term != args.Entries[cnt].Term {
+				oldMsg := ApplyMsg{
+					CommandValid: false,
+					CommandIndex: i,
+					Command:      rf.persistState.logs[i],
+				}
+				rf.applyCh <- oldMsg
+				rf.persistState.logs[i] = args.Entries[cnt]
+
+				newMsg := ApplyMsg{
+					CommandValid: true,
+					CommandIndex: i,
+					Command:      rf.persistState.logs[i],
+				}
+				rf.applyCh <- newMsg
+			}
+			cnt++
+		}
+		if cnt < newEntriesSize {
+			rf.persistState.logs = append(rf.persistState.logs, args.Entries[cnt:]...)
+		}
+	}else{
+		rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
+	}
 }
 
 func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
@@ -428,6 +519,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persistState.logs = append(rf.persistState.logs, newLog)
 		// log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, len(rf.persistState.logs) - 1, newLog)
 		go rf.sendAppendEntriesToFollowers()
+		rf.printCommitLogs()	
 	} else {
 		isLeader = false
 	}
@@ -678,7 +770,11 @@ func (rf *Raft) doAppendEntries(server int, term int) {
 		rf.processAppendEntriesSuccessReply(&args, &reply, server)
 	} else {
 		// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
-		if rf.volatileLeaderState.nextIndex[server] > 1 {
+		diff := rf.volatileLeaderState.nextIndex[server] - rf.volatileLeaderState.matchIndex[server]
+		if diff > 10 {
+			delta := diff / 5
+			rf.volatileLeaderState.nextIndex[server] -= delta
+		} else if rf.volatileLeaderState.nextIndex[server] > 1 {
 			rf.volatileLeaderState.nextIndex[server]--
 		}
 	}
@@ -799,13 +895,13 @@ func (rf *Raft) printCommitLogs() {
 	message := fmt.Sprintf(p, serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex)
 	var builder strings.Builder
 	builder.WriteString(message)
-	logPattern := "%d:%v"
+	logPattern := "%d:%d"
 	for i := 1; i < len(rf.persistState.logs); i++ {
 		log := rf.persistState.logs[i]
 		if i != 1 {
 			builder.WriteString(", ")
 		}
-		builder.WriteString(fmt.Sprintf(logPattern, i, log.Command))
+		builder.WriteString(fmt.Sprintf(logPattern, i, log.Term))
 	}
 	builder.WriteString("]")
 	log.Println(builder.String())
