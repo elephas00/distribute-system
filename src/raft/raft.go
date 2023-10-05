@@ -288,7 +288,7 @@ func (rf *Raft) writeMostProbableInfo(args *AppendEntriesArgs, reply *AppendEntr
 		min = args.PrevLogIndex - 1
 	}
 	for i := min; i >= 0; i-- {
-		if rf.persistState.logs[i].Term <= args.Term {
+		if rf.persistState.logs[i].Term <= args.PrevLogTerm {
 			reply.MostProbableIndex = i
 			for j := i - 1; j >= 0; j-- {
 				if rf.persistState.logs[j].Term == rf.persistState.logs[i].Term {
@@ -305,8 +305,8 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
-
+	log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat,\t args: %+v\n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term, args)
+        rf.printCommitLogs()
 	term := rf.persistState.term
 	logSize := len(rf.persistState.logs)
 	// if discover a server with higher term, convert current server to follower state
@@ -868,7 +868,12 @@ func (rf *Raft) handleAppendEntriesFailure(reply *AppendEntriesReply, server int
 	}
 	if min > 0 {
 		rf.volatileLeaderState.nextIndex[server] = min
-	}
+	}else {
+                rf.volatileLeaderState.nextIndex[server] = 1
+                rf.volatileLeaderState.matchIndex[server] = 0
+                return 
+        }
+
 	for i := min; i > rf.volatileLeaderState.matchIndex[server]; i-- {
 		if rf.persistState.logs[i].Term <= reply.MostProbableTerm {
 			rf.volatileLeaderState.nextIndex[server] = i
