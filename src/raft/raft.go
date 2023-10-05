@@ -40,13 +40,14 @@ const (
 )
 
 const (
-	RPC_FAIL_MAX_RETRY = 1
+	RPC_FAIL_MAX_RETRY = 4
 )
 
 const (
-	FOR_LOOP_FIXED_DELAY_MILLISECONDS                 = 20
-	LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS        = 100
-	FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS = 150
+	FOR_LOOP_FIXED_DELAY_MILLISECONDS                           = 20
+	LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS                  = 100
+	FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS           = 150
+	CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS = 120
 )
 
 const (
@@ -304,7 +305,7 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// log.Printf("server %d (term %d) receive leader %d (term %d) heartbeat \n", rf.me, rf.persistState.term, args.LeaderId, args.Term)
+	log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
 
 	term := rf.persistState.term
 	logSize := len(rf.persistState.logs)
@@ -313,7 +314,6 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.serverState = SERVER_STATE_FOLLOWER
 		rf.persistState.term = args.Term
 		rf.persistState.votedFor = NO_LEADER
-		rf.volatileFollowerState.previosuHeartBeat = time.Now()
 		rf.persist()
 	}
 	if args.Term < term {
@@ -459,12 +459,22 @@ func (rf *Raft) receiveEntries(args *AppendEntriesArgs) {
 	}
 }
 
+func (rf *Raft) isRepeatRequest(args *AppendEntriesArgs) bool {
+	lastLogIndex := len(rf.persistState.logs) - 1
+	argsLastIndex := len(args.Entries) - 1
+	afterReceiveLastLogIndex := args.PrevLogIndex + len(args.Entries)
+	if afterReceiveLastLogIndex > lastLogIndex {
+		return false
+	}
+	return args.Entries[argsLastIndex].Term == rf.persistState.logs[afterReceiveLastLogIndex].Term
+}
+
 func (rf *Raft) noConflicts(args *AppendEntriesArgs) bool {
 	if rf.volatileState.lastApplied <= args.PrevLogIndex {
 		return true
 	}
-	lastLogIndex := len(rf.persistState.logs)
-	argsLastIndex := len(args.Entries)
+	lastLogIndex := len(rf.persistState.logs) - 1
+	argsLastIndex := len(args.Entries) - 1
 	for i, j := args.PrevLogIndex+1, 0; i <= lastLogIndex && i <= rf.volatileState.lastApplied && j <= argsLastIndex; {
 		if rf.persistState.logs[i].Term != args.Entries[j].Term {
 			return false
@@ -511,9 +521,12 @@ func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
 		}
 		rf.persistState.logs = rf.persistState.logs[0 : args.PrevLogIndex+1]
 	}
-	rf.printCommitLogs()
 	// log.Printf("%s %d, term %d, commit %d, args: %+v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex, args)
 	rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
+	newLogs := make([]Log, len(rf.persistState.logs))
+	copy(newLogs, rf.persistState.logs)
+	rf.persistState.logs = newLogs
+	rf.printCommitLogs()
 	rf.persist()
 	// rf.printCommitLogs()
 
@@ -564,21 +577,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-	rf.mu.Lock()
 	// Your code here (2B).
-	if rf.serverState == SERVER_STATE_LEADER {
-		term = rf.persistState.term
-		index = len(rf.persistState.logs)
+	rf.mu.Lock()
+	term := rf.persistState.term
+	isLeader := rf.serverState == SERVER_STATE_LEADER
+	index := len(rf.persistState.logs)
+	if isLeader {
 		newLog := Log{
 			Term:    term,
 			Command: command,
 		}
 		rf.persistState.logs = append(rf.persistState.logs, newLog)
 		// log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, len(rf.persistState.logs) - 1, newLog)
-		go rf.sendAppendEntriesToFollowers()
+		// go rf.sendAppendEntriesToFollowers()
 		rf.printCommitLogs()
 		rf.persist()
 	} else {
@@ -612,6 +623,7 @@ func (rf *Raft) callSendRequestVote() {
 	rf.persistState.term++
 	term := rf.persistState.term
 	rf.persistState.votedFor = rf.me
+	rf.volatileFollowerState.previosuHeartBeat = time.Now()
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -622,12 +634,12 @@ func (rf *Raft) callSendRequestVote() {
 		if i == rf.me {
 			continue
 		}
-		go rf.doRequestVote(i, &getVotes, &heartBeatSended, term)
+		go rf.doRequestVote(i, &getVotes, &heartBeatSended, term, RPC_FAIL_MAX_RETRY)
 	}
 
 }
 
-func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, term int) {
+func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, term int, retry int) {
 	rf.mu.Lock()
 	if rf.persistState.term != term {
 		rf.mu.Unlock()
@@ -645,14 +657,13 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 	reply := RequestVoteReply{}
 	rf.mu.Unlock()
 
-	ok := false
-	for i := 0; !ok && i < RPC_FAIL_MAX_RETRY; i++ {
-		ok = rf.sendRequestVote(server, &args, &reply)
-		if !ok {
-			time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
-		}
-	}
+	ok := rf.sendRequestVote(server, &args, &reply)
+
 	if !ok {
+		if retry > 1 {
+			time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
+			rf.doRequestVote(server, getVotes, heartBeatSended, term, retry-1)
+		}
 		return
 	}
 	// log.Printf("server %d (term %d, %s) received vote from server %d (term %d), result is %v", rf.me, rf.persistState.term, serverStates[rf.serverState], server, reply.Term, reply.VoteGranted)
@@ -670,10 +681,11 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 	if term == rf.persistState.term && reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
 		*getVotes = (*getVotes + 1)
 		if *getVotes > peersNum/2 && !*heartBeatSended {
-			// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
+			log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
+			rf.printCommitLogs()
 			rf.serverState = SERVER_STATE_LEADER
 			*heartBeatSended = true
-			logsNum := lastLogIndex + 1
+			logsNum := len(rf.persistState.logs)
 			// initialize volatile leader info
 			rf.volatileLeaderState.nextIndex = make([]int, peersNum)
 			rf.volatileLeaderState.matchIndex = make([]int, peersNum)
@@ -733,7 +745,8 @@ func (rf *Raft) applyMsg() {
 	rf.mu.Lock()
 	lastApplied := rf.volatileState.lastApplied
 	commitIndex := rf.volatileState.commitIndex
-	for pos := lastApplied + 1; pos <= commitIndex; pos++ {
+	lastLogIndex := len(rf.persistState.logs) - 1
+	for pos := lastApplied + 1; pos <= commitIndex && pos <= lastLogIndex; pos++ {
 		msg := ApplyMsg{
 			Command:      rf.persistState.logs[pos].Command,
 			CommandIndex: pos,
@@ -788,13 +801,13 @@ func (rf *Raft) sendAppendEntriesToFollowers() {
 		if i == me {
 			continue
 		}
-		go rf.doAppendEntries(i, term)
+		go rf.doAppendEntries(i, term, RPC_FAIL_MAX_RETRY)
 	}
 	// log.Printf("server %d (term %d) heart beat, receive %d responds\n", rf.me, rf.persistState.term, respNum)
 
 }
 
-func (rf *Raft) doAppendEntries(server int, term int) {
+func (rf *Raft) doAppendEntries(server int, term int, retry int) {
 	// if last log index >= nextIndex, do below
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
@@ -807,16 +820,14 @@ func (rf *Raft) doAppendEntries(server int, term int) {
 	rf.prepareAppendEntriesArgs(&args, server)
 	rf.mu.Unlock()
 	// log.Printf("leader %d (term %d, commit %d) send append entries to server %d \n", args.LeaderId, args.Term, args.LeaderCommit, server)
-	ok := false
-	for i := 0; !ok && i < RPC_FAIL_MAX_RETRY; i++ {
+	ok := rf.sendAppendEntries(server, &args, &reply)
 
-		ok = rf.sendAppendEntries(server, &args, &reply)
-		if !ok {
-			time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
-		}
-	}
 	if !ok {
 		// log.Printf("APPEND ENTRIES RPC FAILED, server: %d, args:%+v, \n", server, args)
+		if retry > 1 {
+			time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
+			rf.doAppendEntries(server, term, retry-1)
+		}
 		return
 	}
 	// process response
@@ -836,6 +847,12 @@ func (rf *Raft) doAppendEntries(server int, term int) {
 	} else {
 		// log.Printf("leader %d (term %d, commit %d) send append entries to server %d failed, logs: %v, args:%+v \n", args.LeaderId, args.Term, args.LeaderCommit, server, rf.persistState.logs, args)
 		rf.handleAppendEntriesFailure(&reply, server)
+		if retry > 1 {
+			go func(server int, term int, retry int) {
+				time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
+				rf.doAppendEntries(server, term, retry-1)
+			}(server, term, retry)
+		}
 	}
 	rf.mu.Unlock()
 	// log.Printf("retry\n")
@@ -875,22 +892,27 @@ func (rf *Raft) ticker() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 
-		ms := FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
-		// TODO: ms *= 10 is for debug, remove it
-		sleepTime := time.Duration(ms) * time.Millisecond
 		beforeSleep := time.Now()
 		rf.mu.Lock()
 		if rf.serverState == SERVER_STATE_LEADER {
 			rf.mu.Unlock()
 			time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
 		} else if rf.serverState == SERVER_STATE_CANDIDATE {
+			ms := CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
+			sleepTime := time.Duration(ms) * time.Millisecond
+
 			rf.mu.Unlock()
 			time.Sleep(sleepTime)
 		} else {
+			ms := FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
+			sleepTime := time.Duration(ms) * time.Millisecond
+
 			rf.mu.Unlock()
 			time.Sleep(sleepTime)
 		}
 		rf.mu.Lock()
+		before := time.Since(beforeSleep).Milliseconds()
+		log.Printf("%s %d, term %d, still alive, sleep %d milliseconds\n", serverStates[rf.serverState], rf.me, rf.persistState.term, before)
 		if rf.serverState == SERVER_STATE_LEADER {
 			// rf.printCommitLogs()
 			go func() {
@@ -961,6 +983,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	if 1 == 2 {
 		log.Println()
 	}
+	rf.mu.RLock()
+	rf.printServerStartInfo()
+	rf.mu.RUnlock()
 
 	return rf
 }
@@ -971,6 +996,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// log.Printf("send append entries called server:%d, total server num: %d \n", server, n)
 	ok := rf.peers[server].Call("Raft.AppendEntires", args, reply)
 	return ok
+}
+
+func (rf *Raft) printServerStartInfo() {
+	log.Println()
+	log.Printf("------------------------------")
+	log.Printf("server %d start, state: {term: %d, voteFor: %d}", rf.me, rf.persistState.term, rf.persistState.votedFor)
+	rf.printCommitLogs()
+	log.Printf("-------------------------------")
+	log.Println()
 }
 
 func (rf *Raft) printCommitLogs() {

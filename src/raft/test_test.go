@@ -8,12 +8,18 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -1267,4 +1273,34 @@ func TestSnapshotInit2D(t *testing.T) {
 	// do another op to trigger potential bug
 	cfg.one(rand.Int(), servers, true)
 	cfg.end()
+}
+
+func TestLogProcess(t *testing.T) {
+	filename := "nohup.out"
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	outputFilename := "fail.log"
+	outputFile, err := os.Create(outputFilename)
+	if err != nil {
+		log.Fatalf("cannot open %v", outputFilename)
+	}
+
+	strs := strings.Split(string(content), "Test (2B):")
+	log.Printf("content size %d \n", len(content))
+	for _, str := range strs {
+		if strings.Contains(str, "FAIL") && !strings.Contains(str, "... Passed --") {
+			outputFile.WriteString(str)
+			outputFile.WriteString("\n\n")
+		}
+	}
+	outputFile.Close()
+
 }
