@@ -978,9 +978,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// log.Printf("make node %d \n ", me)
 	// start ticker goroutine to start elections
 	go func() {
-		for {
-			rf.ticker()
-		}
+		rf.ticker()	
 	}()
 
 	if 1 == 2 {
