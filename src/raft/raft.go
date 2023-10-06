@@ -40,7 +40,7 @@ const (
 )
 
 const (
-	RPC_FAIL_MAX_RETRY = 4
+	RPC_FAIL_MAX_RETRY = 1
 )
 
 const (
@@ -245,6 +245,28 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidate received vote
 }
 
+func (rf *Raft) convertToFollower() {
+	rf.serverState = SERVER_STATE_FOLLOWER
+	rf.persistState.votedFor = NO_LEADER
+}
+
+func (rf *Raft) convertToCandidate() {
+	rf.serverState = SERVER_STATE_CANDIDATE
+}
+
+func (rf *Raft) convertToLeader() {
+	// initialize volatile leader info
+	rf.serverState = SERVER_STATE_LEADER
+	logsNum := len(rf.persistState.logs)
+	peersNum := len(rf.peers)
+	rf.volatileLeaderState.nextIndex = make([]int, peersNum)
+	rf.volatileLeaderState.matchIndex = make([]int, peersNum)
+	for idx := 0; idx < peersNum; idx++ {
+		rf.volatileLeaderState.nextIndex[idx] = logsNum
+		rf.volatileLeaderState.matchIndex[idx] = 0
+	}
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -253,16 +275,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = term
 	// if there are server with higher term, convert current server to follower state
 	if args.Term > term {
-		rf.serverState = SERVER_STATE_FOLLOWER
 		rf.persistState.term = args.Term
-		rf.persistState.votedFor = NO_LEADER
+		rf.convertToFollower()
 		rf.persist()
 	}
 
 	if args.Term < term {
 		reply.VoteGranted = false
 		// log.Printf("server %d (term %d, %s) reject to vote candidate %d (term %d), because the candidate's term not large than current server", rf.me, rf.persistState.term, serverStates[rf.serverState], args.CandidateId, args.Term)
-	} else if rf.persistState.term == args.Term && rf.persistState.votedFor != NO_LEADER {
+	} else if rf.serverState == SERVER_STATE_LEADER || rf.serverState == SERVER_STATE_CANDIDATE || rf.persistState.votedFor != NO_LEADER {
 		reply.VoteGranted = false
 	} else if rf.persistState.logs[len(rf.persistState.logs)-1].Term > args.LastLogTerm || (rf.persistState.logs[len(rf.persistState.logs)-1].Term == args.LastLogTerm && len(rf.persistState.logs)-1 > args.LastLogIndex) {
 		// candidate is not at least-up-to-date
@@ -270,9 +291,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
-		rf.serverState = SERVER_STATE_FOLLOWER
 		rf.volatileFollowerState.previosuHeartBeat = time.Now()
-		rf.persistState.term = args.Term
 		rf.persistState.votedFor = args.CandidateId
 		rf.persist()
 		// log.Printf("server %d (term %d, %s) vote candidate %d (term %d)", rf.me, rf.persistState.term, serverStates[rf.serverState],args.CandidateId, args.Term)
@@ -311,9 +330,8 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 	logSize := len(rf.persistState.logs)
 	// if discover a server with higher term, convert current server to follower state
 	if args.Term > term {
-		rf.serverState = SERVER_STATE_FOLLOWER
 		rf.persistState.term = args.Term
-		rf.persistState.votedFor = NO_LEADER
+		rf.convertToFollower()
 		rf.persist()
 	}
 	if args.Term < term {
@@ -671,8 +689,7 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 
 	if reply.Term > rf.persistState.term {
 		rf.persistState.term = reply.Term
-		rf.serverState = SERVER_STATE_FOLLOWER
-		rf.persistState.votedFor = NO_LEADER
+		rf.convertToFollower()
 		rf.persist()
 		rf.mu.Unlock()
 		return
@@ -681,18 +698,10 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 	if term == rf.persistState.term && reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
 		*getVotes = (*getVotes + 1)
 		if *getVotes > peersNum/2 && !*heartBeatSended {
-			log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
-			rf.printCommitLogs()
-			rf.serverState = SERVER_STATE_LEADER
+			// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
+			// rf.printCommitLogs()
 			*heartBeatSended = true
-			logsNum := len(rf.persistState.logs)
-			// initialize volatile leader info
-			rf.volatileLeaderState.nextIndex = make([]int, peersNum)
-			rf.volatileLeaderState.matchIndex = make([]int, peersNum)
-			for idx := 0; idx < peersNum; idx++ {
-				rf.volatileLeaderState.nextIndex[idx] = logsNum
-				rf.volatileLeaderState.matchIndex[idx] = 0
-			}
+			rf.convertToLeader()
 			// send heart beat to followers
 			go func() {
 				time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
@@ -834,8 +843,7 @@ func (rf *Raft) doAppendEntries(server int, term int, retry int) {
 	rf.mu.Lock()
 	if reply.Term > rf.persistState.term {
 		rf.persistState.term = reply.Term
-		rf.serverState = SERVER_STATE_FOLLOWER
-		rf.persistState.votedFor = NO_LEADER
+		rf.convertToFollower()
 		rf.persist()
 	}
 	if rf.persistState.term != term {
@@ -856,6 +864,57 @@ func (rf *Raft) doAppendEntries(server int, term int, retry int) {
 	}
 	rf.mu.Unlock()
 	// log.Printf("retry\n")
+}
+
+func (rf *Raft) electionTimeoutTicker() {
+	for rf.killed() == false {
+
+		beforeSleep := time.Now()
+		rf.mu.Lock()
+		if rf.serverState == SERVER_STATE_LEADER {
+			rf.mu.Unlock()
+			time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
+		} else if rf.serverState == SERVER_STATE_CANDIDATE {
+			ms := CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
+			sleepTime := time.Duration(ms) * time.Millisecond
+
+			rf.mu.Unlock()
+			time.Sleep(sleepTime)
+		} else {
+			ms := FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
+			sleepTime := time.Duration(ms) * time.Millisecond
+			rf.mu.Unlock()
+			time.Sleep(sleepTime)
+		}
+
+		rf.mu.Lock()
+		if rf.serverState == SERVER_STATE_CANDIDATE {
+			go func() {
+				rf.callSendRequestVote()
+			}()
+		}
+
+		if rf.serverState == SERVER_STATE_FOLLOWER && rf.volatileFollowerState.previosuHeartBeat.After(beforeSleep) {
+			rf.convertToCandidate()
+			go func() {
+				rf.callSendRequestVote()
+			}()
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) leaderAppendEntriesTicker() {
+	for rf.killed() == false {
+		time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
+		rf.mu.RLock()
+		if rf.serverState == SERVER_STATE_LEADER {
+			go func() {
+				rf.sendAppendEntriesToFollowers()
+			}()
+		}
+		rf.mu.RUnlock()
+	}
 }
 
 func (rf *Raft) handleAppendEntriesFailure(reply *AppendEntriesReply, server int) {
@@ -930,7 +989,7 @@ func (rf *Raft) ticker() {
 				if rf.volatileFollowerState.previosuHeartBeat.After(beforeSleep) {
 
 				} else {
-					rf.serverState = SERVER_STATE_CANDIDATE
+					rf.convertToCandidate()
 					go func() {
 						rf.callSendRequestVote()
 					}()
@@ -978,8 +1037,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// log.Printf("make node %d \n ", me)
 	// start ticker goroutine to start elections
 	go func() {
-		rf.ticker()	
+		rf.ticker()
 	}()
+	// go func (){
+	// 	rf.electionTimeoutTicker()
+	// }()
+
+	// go func(){
+	// 	rf.leaderAppendEntriesTicker()
+	// }()
 
 	if 1 == 2 {
 		log.Println()
