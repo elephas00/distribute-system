@@ -122,12 +122,12 @@ type VolatileState struct {
 }
 
 type PersistentState struct {
-	term     int
-	votedFor int
-	logs     []Log
-}
-
-type Term struct {
+	term              int
+	votedFor          int
+	logs              []Log
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	snapshot          []byte
 }
 
 type Log struct {
@@ -149,6 +149,21 @@ type AppendEntriesReply struct {
 	Success           bool // true if follower contained entry matching
 	MostProbableIndex int
 	MostProbableTerm  int
+}
+
+// for 2D
+type InstallSnapshotArgs struct {
+	Term              int // leader's term
+	LeaderId          int // so follower can redirect clients
+	LastIncludedIndex int // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int
+	// Offset            int
+	Data []byte
+	// Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 // return currentTerm and whether this server
@@ -187,8 +202,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.persistState.term)
 	e.Encode(rf.persistState.votedFor)
 	e.Encode(rf.persistState.logs)
+	e.Encode(rf.persistState.lastIncludedIndex)
+	e.Encode(rf.persistState.lastIncludedTerm)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.persistState.snapshot)
 
 }
 
@@ -201,17 +218,21 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var term, votedFor int
+	var term, votedFor, lastLogIncludedIndex, lastLogIncludedTerm int
 	var logs []Log
 	if d.Decode(&term) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&logs) != nil ||
+		d.Decode(&lastLogIncludedIndex) != nil ||
+		d.Decode(&lastLogIncludedTerm) != nil {
 		log.Fatal("read persist failed")
 	} else {
 		rf.mu.Lock()
 		rf.persistState.term = term
 		rf.persistState.votedFor = votedFor
 		rf.persistState.logs = logs
+		rf.persistState.lastIncludedIndex = lastLogIncludedIndex
+		rf.persistState.lastIncludedTerm = lastLogIncludedTerm
 		rf.mu.Unlock()
 	}
 
@@ -223,7 +244,56 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
 
+	lastIndexInLog := rf.translateIndex(index)
+	rf.persistState.logs = rf.persistState.logs[lastIndexInLog:]
+	rf.persistState.lastIncludedIndex = index
+	rf.persistState.lastIncludedTerm = rf.persistState.logs[0].Term
+	rf.persistState.snapshot = snapshot
+	rf.persist() 
+
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) translateIndex(index int) int {
+	return index - rf.persistState.lastIncludedIndex;
+}
+
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 1. Reply immediately if term < currentTerm
+	currentTerm := rf.persistState.term
+	reply.Term = currentTerm
+	if args.Term < currentTerm {
+		return
+	}
+
+	rf.mu.Lock()
+	if args.Term > rf.persistState.term {
+		rf.persistState.term = args.Term
+	}
+	sentinel := Log {
+		Term: args.LastIncludedTerm,
+		Command: nil,
+	}
+	rf.persistState.logs = []Log{sentinel}
+	rf.persistState.lastIncludedIndex = args.LastIncludedIndex
+	rf.persistState.lastIncludedTerm = args.LastIncludedTerm
+	rf.persistState.snapshot = args.Data
+	rf.persist()
+	msg := ApplyMsg {
+		SnapshotValid: true,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm: args.LastIncludedTerm,
+		Snapshot: args.Data,
+	}
+	rf.applyCh <- msg
+	rf.mu.Unlock()
+	
 }
 
 // example RequestVote RPC arguments structure.
@@ -944,6 +1014,14 @@ func (rf *Raft) handleAppendEntriesFailure(reply *AppendEntriesReply, server int
 	}
 }
 
+func (rf *Raft) getLog(index int) Log {
+	return rf.persistState.logs[index-rf.persistState.lastIncludedIndex-1]
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return rf.persistState.lastIncludedIndex + len(rf.persistState.logs) - 1
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
@@ -1029,11 +1107,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	leaderState := VolatileLeaderState{}
 	rf.volatileLeaderState = leaderState
 	// initialize logs
-	sentienl := Log{Term: 0}
-	rf.persistState.logs = []Log{sentienl}
+	sentinel := Log{Term: 0}
+	rf.persistState.logs = []Log{sentinel}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if rf.persistState.lastIncludedIndex > 0 {
+		snapshot := rf.persister.ReadSnapshot()
+		rf.persistState.snapshot = snapshot
+		msg := ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      snapshot,
+			SnapshotIndex: rf.persistState.lastIncludedIndex,
+			SnapshotTerm:  rf.persistState.lastIncludedTerm,
+		}
+		rf.applyCh <- msg
+	}
+
 	// log.Printf("make node %d \n ", me)
 	// start ticker goroutine to start elections
 	go func() {
