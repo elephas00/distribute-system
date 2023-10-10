@@ -246,7 +246,7 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
-	log.Printf("%s %d, term %d, called snapshot() \n", serverStates[rf.serverState], rf.me, rf.persistState.term)
+	// log.Printf("%s %d, term %d, called snapshot() \n", serverStates[rf.serverState], rf.me, rf.persistState.term)
 	lastIndexInLog := rf.toRelativeIndex(index)
 	rf.persistState.logs = rf.persistState.logs[lastIndexInLog:]
 	rf.persistState.lastIncludedIndex = index
@@ -272,7 +272,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		}
 	}
 	rf.persist()
-	log.Printf("%s %d, term %d, after snapshot() \n", serverStates[rf.serverState], rf.me, rf.persistState.term)
+	// log.Printf("%s %d, term %d, after snapshot() \n", serverStates[rf.serverState], rf.me, rf.persistState.term)
 	rf.printCommitLogs()
 	// rf.mu.Unlock()
 }
@@ -298,7 +298,7 @@ func (rf *Raft) toRelativeIndex(index int) int {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("%s %d, term %d, called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
+	// log.Printf("%s %d, term %d, called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
 	// 1. Reply immediately if term < currentTerm
 	currentTerm := rf.persistState.term
 	reply.Term = currentTerm
@@ -323,7 +323,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.volatileState.lastApplied = args.LastIncludedIndex
 	rf.volatileState.commitIndex = args.LastIncludedIndex
 	rf.persist()
-	log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
+	// log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
 	rf.printCommitLogs()
 }
 
@@ -430,7 +430,7 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat,\t args: %+v\n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term, args)
+	// log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat,\t args: %+v\n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term, args)
 	rf.printCommitLogs()
 	term := rf.persistState.term
 	// if discover a server with higher term, convert current server to follower state]
@@ -448,10 +448,10 @@ func (rf *Raft) AppendEntires(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		reply.Success = false
 		return
-	} 
-	if args.PrevLogIndex < rf.persistState.lastIncludedIndex {
-		args = rf.modifyArgs(args)
-	}	
+	}
+	if args.PrevLogIndex < rf.persistState.lastIncludedIndex || args.PrevLogIndex < rf.volatileState.commitIndex {
+		args = rf.handleCommittedArgs(args)
+	}
 	if rf.getLastLogIndex() < args.PrevLogIndex || args.PrevLogIndex >= rf.persistState.lastIncludedIndex && rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
 		// the index of log entries are not match current follower, just receive heart beat, but reject log
 		// log.Printf("MARK 3")
@@ -523,18 +523,22 @@ func (rf *Raft) noConflicts(args *AppendEntriesArgs) bool {
 	return true
 }
 
-func (rf *Raft) modifyArgs(args *AppendEntriesArgs) *AppendEntriesArgs{
-	start := rf.persistState.lastIncludedIndex - args.PrevLogIndex
+func (rf *Raft) handleCommittedArgs(args *AppendEntriesArgs) *AppendEntriesArgs {
+	max := rf.persistState.lastIncludedIndex
+	if max < rf.volatileState.commitIndex {
+		max = rf.volatileState.commitIndex
+	}
+	start := max - args.PrevLogIndex - 1
 	newArgs := AppendEntriesArgs{
 		Term:         args.Term,
 		LeaderId:     args.LeaderId,
-		PrevLogIndex: rf.persistState.lastIncludedIndex,
+		PrevLogIndex: max,
 		PrevLogTerm:  args.Entries[start].Term,
 		Entries:      args.Entries[start+1:],
 		LeaderCommit: args.LeaderCommit,
 	}
 	return &newArgs
-		
+
 }
 
 func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
@@ -645,7 +649,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		}
 		rf.persistState.logs = append(rf.persistState.logs, newLog)
-		log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, newLog)
+		// log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, newLog)
 		// go rf.sendAppendEntriesToFollowers()
 		rf.printCommitLogs()
 		rf.persist()
@@ -741,15 +745,22 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 			// rf.printCommitLogs()
 			*heartBeatSended = true
 			rf.convertToLeader()
-			// send heart beat to followers
-			go func() {
-				time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
-				rf.sendAppendEntriesToFollowers()
+			// noOp := Log{
+			// 	Term:    rf.persistState.term,
+			// 	Index:   rf.getLastLogIndex() + 1,
+			// 	Command: nil,
+			// }
+			// rf.persistState.logs = append(rf.persistState.logs, noOp)
 
-				// the ticker may sleeping a little long, so the heart beat will not send timely as considered.
-				time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
-				rf.sendAppendEntriesToFollowers()
-			}()
+			// send heart beat to followers
+			// go func() {
+			// 	time.Sleep(time.Millisecond * FOR_LOOP_FIXED_DELAY_MILLISECONDS)
+			// 	rf.sendAppendEntriesToFollowers()
+
+			// 	// // the ticker may sleeping a little long, so the heart beat will not send timely as considered.
+			// 	time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
+			// 	rf.sendAppendEntriesToFollowers()
+			// }()
 		}
 	}
 	rf.mu.Unlock()
@@ -780,8 +791,8 @@ func (rf *Raft) processAppendEntriesSuccessReply(args *AppendEntriesArgs, reply 
 		}
 		if cnt > peersNum/2 {
 			rf.volatileState.commitIndex = commitIndex
-			log.Printf("%s %d, term %d, commit %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex)
-			rf.printCommitLogs()
+			// log.Printf("%s %d, term %d, commit %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex)
+			// rf.printCommitLogs()
 			// apply commited logs to state machine
 			go rf.applyMsg()
 			break
@@ -918,31 +929,34 @@ func (rf *Raft) electionTimeoutTicker() {
 	for rf.killed() == false {
 
 		beforeSleep := time.Now()
-		rf.mu.Lock()
+		rf.mu.RLock()
+		// log.Printf("%s %d, term %d ELECTION 1\n", serverStates[rf.serverState], rf.me, rf.persistState.term)
 		if rf.serverState == SERVER_STATE_LEADER {
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
 		} else if rf.serverState == SERVER_STATE_CANDIDATE {
 			ms := CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % CANDIDATE_ELECTION_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
 			sleepTime := time.Duration(ms) * time.Millisecond
 
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			time.Sleep(sleepTime)
 		} else {
 			ms := FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS + (rand.Int63() % FOLLOWER_TIME_OUT_HALF_AVERAGE_DELAY_MILLISECONDS)
 			sleepTime := time.Duration(ms) * time.Millisecond
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			time.Sleep(sleepTime)
 		}
 
 		rf.mu.Lock()
+		// log.Printf("%s %d, term %d ELECTION 2\n", serverStates[rf.serverState], rf.me, rf.persistState.term)
+
 		if rf.serverState == SERVER_STATE_CANDIDATE {
 			go func() {
 				rf.callSendRequestVote()
 			}()
 		}
 
-		if rf.serverState == SERVER_STATE_FOLLOWER && rf.volatileFollowerState.previosuHeartBeat.After(beforeSleep) {
+		if rf.serverState == SERVER_STATE_FOLLOWER && rf.volatileFollowerState.previosuHeartBeat.Before(beforeSleep) {
 			rf.convertToCandidate()
 			go func() {
 				rf.callSendRequestVote()
@@ -954,14 +968,16 @@ func (rf *Raft) electionTimeoutTicker() {
 
 func (rf *Raft) leaderAppendEntriesTicker() {
 	for rf.killed() == false {
-		time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
 		rf.mu.RLock()
 		if rf.serverState == SERVER_STATE_LEADER {
 			go func() {
 				rf.sendAppendEntriesToFollowers()
 			}()
 		}
+		// log.Printf("%s %d, term %d LEADER APPEND ENTRIES\n", serverStates[rf.serverState], rf.me, rf.persistState.term)
 		rf.mu.RUnlock()
+
+		time.Sleep(time.Millisecond * LEADER_HEARTBEATS_FIXED_DELAY_MILLISECONDS)
 	}
 }
 
@@ -1148,16 +1164,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// log.Printf("make node %d \n ", me)
 	// start ticker goroutine to start elections
+	// go func() {
+	// 	rf.ticker()
+	// }()
 	go func() {
-		rf.ticker()
+		rf.electionTimeoutTicker()
 	}()
-	// go func (){
-	// 	rf.electionTimeoutTicker()
-	// }()
 
-	// go func(){
-	// 	rf.leaderAppendEntriesTicker()
-	// }()
+	go func() {
+		rf.leaderAppendEntriesTicker()
+	}()
 
 	if 1 == 2 {
 		log.Println()
@@ -1208,5 +1224,5 @@ func (rf *Raft) printCommitLogs() {
 		builder.WriteString(fmt.Sprintf(logPattern, log.Index, log.Term))
 	}
 	builder.WriteString("]")
-	log.Println(builder.String())
+	// log.Println(builder.String())
 }
