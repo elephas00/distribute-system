@@ -822,20 +822,20 @@ func (rf *Raft) applyMsg() {
 }
 
 func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int) {
-	globalLastLogIndex := rf.getLastLogIndex()
+	lastLogIndex := rf.getLastLogIndex()
 	nextIdx := rf.volatileLeaderState.nextIndex[server]
 	args.LeaderId = rf.me
 	args.LeaderCommit = rf.volatileState.commitIndex
 	args.Term = rf.persistState.term
 
-	if nextIdx > globalLastLogIndex {
-		// heart beat, send empty log entry
-		args.PrevLogIndex = globalLastLogIndex
-		args.PrevLogTerm = rf.getLog(globalLastLogIndex).Term
+	if nextIdx > lastLogIndex {
+		// heart beat, nothing to send
+		args.PrevLogIndex = lastLogIndex
+		args.PrevLogTerm = rf.getLog(lastLogIndex).Term
 		args.Entries = []Log{}
 
 		// log.Printf("branch1, next index %d, last log index %d, leader logs: %v, args: %+v\n",nextIdx, lastLogIdx, rf.persistState.logs, args)
-	} else if nextIdx > rf.persistState.lastIncludedIndex {
+	} else if nextIdx >= rf.persistState.lastIncludedIndex {
 		// there are new logs send to followers
 		prevLogIndex := nextIdx - 1
 		args.PrevLogIndex = prevLogIndex
@@ -846,6 +846,7 @@ func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int) {
 		// log.Printf("branch2 next index %d, last log index %d, leader logs: %v, args: %+v\n",nextIdx, lastLogIdx, rf.persistState.logs, args)
 	} else {
 		// in this situation, leader should send install snapshot request to follower, so just send all and wait for failure handle
+		// try to send something current leader contains
 		args.PrevLogIndex = rf.persistState.lastIncludedIndex
 		args.PrevLogTerm = rf.getLog(args.PrevLogIndex).Term
 		args.Entries = rf.persistState.logs[1:]
