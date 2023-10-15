@@ -137,6 +137,25 @@ type Log struct {
 	Command interface{}
 }
 
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term         int // candidate’s term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry (§5.4)
+	LastLogTerm  int // term of candidate’s last log entry (§5.4)
+
+}
+
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
+}
+
 type AppendEntriesArgs struct {
 	Term         int   // leader’s term
 	LeaderId     int   // so follower can redirect clients
@@ -249,6 +268,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	// ok := rf.mu.TryLock()
+	// if !ok {
+	// 	return 0, 0, false
+	// }
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.persistState.term
@@ -261,7 +284,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		}
 		rf.persistState.logs = append(rf.persistState.logs, newLog)
-		rf.printCommitLogs()
 		rf.persist()
 		go rf.sendAppendEntriesToFollowers()
 		// log.Printf("%s %d (term %d) receive a new Log (index %d), detail: %v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, newLog)
@@ -315,8 +337,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat,\t args: %+v\n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term, args)
-	rf.printCommitLogs()
+	// log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat,\t args: %+v\n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term, args)
 
 	term := rf.persistState.term
 	reply.Term = term
@@ -369,59 +390,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-func (rf *Raft) AppendEntiresCopy(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// log.Printf("%s %d (term %d) receive leader %d (term %d) heartbeat,\t args: %+v\n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term, args)
-	rf.printCommitLogs()
-
-	term := rf.persistState.term
-	reply.Term = term
-	// if discover a server with higher term, convert current server to follower state]
-	if args.Term > term {
-		rf.persistState.term = args.Term
-		rf.convertToFollower()
-		rf.persist()
-	}
-	if args.Term < term {
-		// log.Printf("server %d (term %d) reject leader %d (term %d) heartbeat,  \n", rf.me, rf.persistState.term, args.LeaderId, args.Term)
-		reply.Success = false
-		return
-	}
-	if args.PrevLogIndex < rf.persistState.lastIncludedIndex || args.PrevLogIndex < rf.volatileState.commitIndex {
-		if args.LeaderCommit < rf.volatileState.commitIndex {
-			return
-		}
-		args = rf.handleCommittedArgs(args)
-	}
-	if rf.getLastLogIndex() < args.PrevLogIndex || args.PrevLogIndex >= rf.persistState.lastIncludedIndex && rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
-		// the index of log entries are not match current follower, just receive heart beat, but reject log
-		reply.Success = false
-		rf.volatileFollowerState.previosuHeartBeat = time.Now()
-		rf.leader = args.LeaderId
-		rf.serverState = SERVER_STATE_FOLLOWER
-		rf.writeMostProbableInfo(args, reply)
-		// log.Printf("server %d (term %d) logs: %v, reject heart beat %+v  \n", rf.me, rf.persistState.term, rf.persistState.logs, args)
-	} else {
-		reply.Success = true
-		// update state
-		rf.volatileFollowerState.previosuHeartBeat = time.Now()
-		rf.leader = args.LeaderId
-		rf.serverState = SERVER_STATE_FOLLOWER
-		// there are new logs to receive
-		if len(args.Entries) > 0 {
-			// update log
-			rf.receiveLogs(args)
-			rf.persist()
-		}
-		// there might commit some logs
-		if args.LeaderCommit > rf.volatileState.commitIndex {
-			// apply committed logs to state machine
-			rf.updateCommit(args)
-		}
-	}
-}
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -433,7 +401,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("%s %d, term %d, called snapshot(), index %d, oldlastIndex %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, rf.persistState.lastIncludedIndex)
+	// log.Printf("%s %d, term %d, called snapshot(), index %d, oldlastIndex %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, rf.persistState.lastIncludedIndex)
 	lastIndexInLog := rf.toRelativeIndex(index)
 	rf.persistState.logs = rf.persistState.logs[lastIndexInLog:]
 	newLogs := make([]Log, len(rf.persistState.logs))
@@ -501,13 +469,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	rf.volatileState.appliedMsgCacheChan <- msg
 	rf.volatileState.lastApplied = args.LastIncludedIndex
-	if rf.volatileState.commitIndex > args.LastIncludedIndex {
-		log.Printf("commit index roll backed 2 \n")
-	}
 	rf.volatileState.commitIndex = args.LastIncludedIndex
 	rf.persist()
 	// log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
-	rf.printCommitLogs()
 }
 
 func (rf *Raft) updateCommit(args *AppendEntriesArgs) {
@@ -517,11 +481,7 @@ func (rf *Raft) updateCommit(args *AppendEntriesArgs) {
 		min = args.LeaderCommit
 	}
 	if min > rf.volatileState.commitIndex {
-		if min < rf.volatileState.commitIndex {
-			log.Printf("commit index roll backed 3 \n")
-		}
 		rf.volatileState.commitIndex = min
-		rf.printCommitLogs()
 		go rf.applyMsg()
 	}
 }
@@ -579,10 +539,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.persistState.lastIncludedIndex = lastLogIncludedIndex
 		rf.persistState.lastIncludedTerm = lastLogIncludedTerm
 		rf.volatileState.commitIndex = rf.persistState.lastIncludedIndex
-
-		if rf.persistState.lastIncludedIndex < rf.volatileState.commitIndex {
-			log.Printf("commit index roll backed 4 \n")
-		}
 		rf.volatileState.lastApplied = rf.persistState.lastIncludedIndex
 	}
 	// log.Printf("MARK 9")
@@ -604,25 +560,6 @@ func (rf *Raft) getLog(absoluteIndex int) Log {
 
 func (rf *Raft) toRelativeIndex(index int) int {
 	return index - rf.persistState.lastIncludedIndex
-}
-
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int // candidate’s term
-	CandidateId  int // candidate requesting vote
-	LastLogIndex int // index of candidate’s last log entry (§5.4)
-	LastLogTerm  int // term of candidate’s last log entry (§5.4)
-
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int  // currentTerm, for candidate to update itself
-	VoteGranted bool // true means candidate received vote
 }
 
 func (rf *Raft) convertToFollower() {
@@ -669,96 +606,6 @@ func (rf *Raft) writeMostProbableInfo(args *AppendEntriesArgs, reply *AppendEntr
 	} else {
 		reply.MostProbableTerm = rf.getLog(reply.MostProbableIndex).Term
 	}
-}
-
-func (rf *Raft) noConflicts(args *AppendEntriesArgs) bool {
-	if rf.volatileState.lastApplied <= args.PrevLogIndex {
-		return true
-	}
-
-	argsLastIndex := len(args.Entries) - 1
-	for i, j := args.PrevLogIndex+1, 0; i <= rf.getLastLogIndex() && i <= rf.volatileState.lastApplied && j <= argsLastIndex; {
-		if rf.getLog(i).Term != args.Entries[j].Term {
-			return false
-		}
-		i++
-		j++
-	}
-	return true
-}
-
-func (rf *Raft) handleCommittedArgs(args *AppendEntriesArgs) *AppendEntriesArgs {
-	max := rf.persistState.lastIncludedIndex
-	if max < rf.volatileState.commitIndex {
-		max = rf.volatileState.commitIndex
-	}
-	start := max - args.PrevLogIndex - 1
-	if start >= len(args.Entries) {
-		log.Printf("%s %d, term %d, lastIncluded %d, lastCommitted:%d, args:%+v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.persistState.lastIncludedIndex, rf.volatileState.commitIndex, args)
-		rf.printCommitLogs()
-	}
-	newArgs := AppendEntriesArgs{
-		Term:         args.Term,
-		LeaderId:     args.LeaderId,
-		PrevLogIndex: max,
-		PrevLogTerm:  args.Entries[start].Term,
-		LeaderCommit: args.LeaderCommit,
-	}
-	if start > len(args.Entries) {
-		newArgs.Entries = args.Entries[start+1:]
-	}
-	return &newArgs
-}
-
-func (rf *Raft) receiveLogs(args *AppendEntriesArgs) {
-	// newLatestIndex := len(args.Entries) + args.PrevLogIndex
-	// if rf.volatileState.commitIndex >= newLatestIndex {
-	// 	return
-	// }
-
-	// there are some conflicts
-
-	if rf.noConflicts(args) {
-		rf.persistState.logs = rf.persistState.logs[rf.toRelativeIndex(rf.persistState.lastIncludedIndex) : rf.toRelativeIndex(args.PrevLogIndex)+1]
-	} else if rf.getLastLogIndex() > args.PrevLogIndex {
-		// log.Printf("MARK 5-2")
-		for pos := args.PrevLogIndex + 1; pos <= rf.volatileState.lastApplied; pos++ {
-			msg := ApplyMsg{
-				CommandValid: false,
-				CommandIndex: pos,
-				Command:      rf.getLog(pos),
-			}
-			rf.volatileState.appliedMsgCacheChan <- msg
-		}
-
-		var min = rf.volatileState.lastApplied
-		if min > args.LeaderCommit {
-			min = args.LeaderCommit
-		}
-		if min > args.PrevLogIndex {
-			min = args.PrevLogIndex
-		}
-		if min != rf.volatileState.lastApplied {
-			lastestLogIndexAfterReceive := args.PrevLogIndex + len(args.Entries)
-			message := "%s %d term %d, roll back triggerd, oldCommit %d, now commit %d, after receive log latest log index %d \n"
-			log.Printf(message, serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex, min, lastestLogIndexAfterReceive)
-			rf.volatileState.lastApplied = min
-			if min < rf.volatileState.commitIndex {
-				log.Printf("commit index roll backed 5 \n")
-			}
-			rf.volatileState.commitIndex = min
-		}
-		rf.persistState.logs = rf.persistState.logs[0 : rf.toRelativeIndex(args.PrevLogIndex)+1]
-	}
-	// log.Printf("MARK 5-3")
-	// log.Printf("%s %d, term %d, commit %d, args: %+v \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex, args)
-	rf.persistState.logs = append(rf.persistState.logs, args.Entries...)
-	newLogs := make([]Log, len(rf.persistState.logs))
-	copy(newLogs, rf.persistState.logs)
-	rf.persistState.logs = newLogs
-	rf.printCommitLogs()
-	rf.persist()
-	// rf.printCommitLogs()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -873,10 +720,10 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 	if term == rf.persistState.term && reply.VoteGranted && rf.serverState == SERVER_STATE_CANDIDATE {
 		*getVotes = (*getVotes + 1)
 		if *getVotes > peersNum/2 && !*heartBeatSended {
-			log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
-			rf.printCommitLogs()
+			// log.Printf("server %d get %d votes and win the election on term %d , now begin send heartbeat\n", rf.me, *getVotes, rf.persistState.term)
 			*heartBeatSended = true
 			rf.convertToLeader()
+			go rf.sendAppendEntriesToFollowers()
 			// noOp := Log{
 			// 	Term:    rf.persistState.term,
 			// 	Index:   rf.getLastLogIndex() + 1,
@@ -912,12 +759,8 @@ func (rf *Raft) processAppendEntriesSuccessReply(args *AppendEntriesArgs, reply 
 			}
 		}
 		if cnt > peersNum/2 {
-			if commitIndex < rf.volatileState.commitIndex {
-				log.Printf("commit index roll backed 1 \n")
-			}
 			rf.volatileState.commitIndex = commitIndex
-			log.Printf("%s %d, term %d, commit %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex)
-			rf.printCommitLogs()
+			// log.Printf("%s %d, term %d, commit %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex)
 			// apply commited logs to state machine
 			go rf.applyMsg()
 			break
