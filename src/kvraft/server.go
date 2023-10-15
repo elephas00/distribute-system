@@ -1,12 +1,16 @@
 package kvraft
 
 import (
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
 const Debug = false
@@ -18,11 +22,16 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	RequestId int
+	ClientId  int
+	Method    string
+	Key       string
+	Value     string
+	Err       Err
 }
 
 type KVServer struct {
@@ -35,15 +44,192 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	stateMachine  map[string]string
+	lastRequestId map[int]int
+	lastResponse  map[int]Op
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	ok := kv.mu.TryLock()
+	if !ok {
+		return
+	}
+	if lastRid, exist := kv.lastRequestId[args.ClientId]; exist && lastRid == args.RequestId {
+		op, exist := kv.lastResponse[args.ClientId]
+		kv.mu.Unlock()
+		if !exist {
+			kv.waitGetReply(args, reply)
+		} else {
+			reply.Err = op.Err
+			reply.Value = op.Value
+			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
+		}
+		return
+	}
+
+	getOp := Op{
+		Method:    GET,
+		Key:       args.Key,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+
+	_, _, isLeader := kv.rf.Start(getOp)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	// log.Printf("leader %d receive command: %d, requestId:%d, clientId:%d\n", kv.me, index, args.RequestId, args.ClientId)
+	kv.mu.Unlock()
+	kv.waitGetReply(args, reply)
+
+}
+
+func (kv *KVServer) waitGetReply(args *GetArgs, reply *GetReply) {
+	for i := 0; i < 10; i++ {
+		ok := kv.mu.TryLock()
+		if !ok {
+			time.Sleep(time.Millisecond * 10)
+			continue
+		}
+		rId, exist := kv.lastRequestId[args.ClientId]
+		if exist && rId == args.RequestId {
+			resp := kv.lastResponse[args.ClientId]
+			reply.Err = resp.Err
+			reply.Value = resp.Value
+			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
+			kv.mu.Unlock()
+			return
+		} else {
+			kv.mu.Unlock()
+			time.Sleep(time.Millisecond * 10)
+		}
+
+	}
+}
+
+func (kv *KVServer) applier() {
+	for {
+		msg := <-kv.applyCh
+		kv.mu.Lock()
+		kv.applyMsg(&msg)
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
+	if msg.Command == nil && !msg.SnapshotValid {
+		// log.Printf("server:%d apply nil command %+v\n", kv.me, msg)
+		return
+	}
+	op, ok := msg.Command.(Op)
+	if !ok {
+		// log.Printf("COMMAND is not operation")
+		return
+	}
+	// duplicate request
+	if rId, exist := kv.lastRequestId[op.ClientId]; exist && rId == op.RequestId {
+		return
+	}
+	if op.Method == APPEND {
+		val, exist := kv.stateMachine[op.Key]
+		op.Err = OK
+		if exist {
+			kv.stateMachine[op.Key] = val + op.Value
+		} else {
+			kv.stateMachine[op.Key] = op.Value
+		}
+	} else if op.Method == PUT {
+		kv.stateMachine[op.Key] = op.Value
+		op.Err = OK
+	} else if op.Method == GET {
+		val, exist := kv.stateMachine[op.Key]
+		if exist {
+			op.Err = OK
+			op.Value = val
+		} else {
+			op.Err = ErrNoKey
+			op.Value = ""
+		}
+	}
+	kv.lastRequestId[op.ClientId] = op.RequestId
+	kv.lastResponse[op.ClientId] = op
+	// log.Printf("server:%d apply command %d, detail %+v  \n", kv.me, msg.CommandIndex, op)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	ok := kv.mu.TryLock()
+	if !ok {
+		return
+	}
+
+	if lastRid, exist := kv.lastRequestId[args.ClientId]; exist && lastRid == args.RequestId {
+		op, exist := kv.lastResponse[args.ClientId]
+		kv.mu.Unlock()
+		if !exist {
+			kv.waitPutAppendReply(args, reply)
+		} else {
+			reply.Err = op.Err
+			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
+		}
+		return
+	}
+	putAppendOp := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	if args.Op == PUT {
+		putAppendOp.Method = PUT
+	} else {
+		putAppendOp.Method = APPEND
+	}
+	_, _, isLeader := kv.rf.Start(putAppendOp)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	kv.waitPutAppendReply(args, reply)
+}
+
+func (kv *KVServer) waitPutAppendReply(args *PutAppendArgs, reply *PutAppendReply) {
+	for i := 0; i < 10; i++ {
+		ok := kv.mu.TryLock()
+		if !ok {
+			time.Sleep(time.Millisecond * 10)
+			continue
+		}
+		rId, exist := kv.lastRequestId[args.ClientId]
+		// log.Printf("server %d, lastRequestId %d, args.RequestId %d \n", kv.me, rId, args.RequestId)
+		if exist && rId == args.RequestId {
+			// log.Printf("server %d finished request %+v, reply %+v \n", kv.me, args, reply)
+			reply.Err = kv.lastResponse[args.ClientId].Err
+			kv.mu.Unlock()
+			return
+		} else {
+			kv.mu.Unlock()
+			time.Sleep(time.Millisecond * 10)
+		}
+
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -81,17 +267,34 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-
 	kv := new(KVServer)
+	kv.mu.Lock()
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
+	kv.stateMachine = make(map[string]string)
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	kv.stateMachine = make(map[string]string)
+	kv.lastRequestId = make(map[int]int)
+	kv.lastResponse = make(map[int]Op)
+	kv.mu.Unlock()
+	go kv.applier()
 	return kv
+}
+
+func (kv *KVServer) printStateMachine() {
+	p := "leader %d state machine: [\n"
+	message := fmt.Sprintf(p, kv.me)
+	var builder strings.Builder
+	builder.WriteString(message)
+	logPattern := "{%s:%s}\n"
+	for k, v := range kv.stateMachine {
+		builder.WriteString(fmt.Sprintf(logPattern, k, v))
+	}
+	builder.WriteString("]")
+	log.Println(builder.String())
 }
