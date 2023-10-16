@@ -83,6 +83,7 @@ finish() {
 		((failed += 1))
 	else
 		((success += 1))
+		(rm -rf "test-${is[0]}.err" "test-${is[0]}.log")
 	fi
 
 	if [ "$failed" -eq 0 ]; then
