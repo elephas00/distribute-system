@@ -46,10 +46,11 @@ type KVServer struct {
 	maxraftstate           int // snapshot if log grows this big
 	logReplayOverheadBytes int
 	// Your definitions here.
-	stateMachine  map[string]string
-	lastRequestId map[int]int
-	lastResponse  map[int]Op
-	persister     *raft.Persister
+	stateMachine     map[string]string
+	lastRequestId    map[int]int
+	lastResponse     map[int]Op
+	persister        *raft.Persister
+	lastCommandIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -67,14 +68,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if lastRid, exist := kv.lastRequestId[args.ClientId]; exist && lastRid == args.RequestId {
 		op, exist := kv.lastResponse[args.ClientId]
 		kv.mu.Unlock()
-		if !exist {
-			kv.waitGetReply(args, reply)
-		} else {
+		if exist {
 			reply.Err = op.Err
 			reply.Value = op.Value
-			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
+			return
 		}
-		return
 	}
 
 	getOp := Op{
@@ -129,13 +127,26 @@ func (kv *KVServer) applier() {
 		msg := <-kv.applyCh
 		kv.mu.Lock()
 		if msg.CommandValid {
+			if msg.CommandIndex == kv.lastCommandIndex {
+				log.Printf("warning: duplicated command %+v\n", msg)
+			} else if msg.CommandIndex > kv.lastCommandIndex+1 {
+				log.Printf("warning: missing some command, now %d, last %d\n", msg.CommandIndex, kv.lastCommandIndex)
+			} else if msg.CommandIndex < kv.lastCommandIndex {
+				log.Printf("warning: outdated command, now %d, last %d\n", msg.CommandIndex, kv.lastCommandIndex)
+			}
+			kv.lastCommandIndex = msg.CommandIndex
+			oldStateMachineBytes := len(kv.getStateMachineBytes())
 			kv.applyMsg(&msg)
+			newStateMachineBytes := len(kv.getStateMachineBytes())
+			kv.logReplayOverheadBytes += int(unsafe.Sizeof(msg)) + newStateMachineBytes - oldStateMachineBytes
 		}
 		if msg.SnapshotValid {
 			kv.applySnapshot(&msg)
 		}
 		if kv.maxraftstate != NO_SNAPSHOT && kv.getRaftSize() > kv.maxraftstate {
-			kv.writeSnapshot(msg.CommandIndex)
+			stateMachineState := kv.getStateMachineBytes()
+			kv.rf.Snapshot(msg.CommandIndex, stateMachineState)
+			kv.logReplayOverheadBytes = 0
 		}
 		kv.mu.Unlock()
 	}
@@ -143,6 +154,8 @@ func (kv *KVServer) applier() {
 
 func (kv *KVServer) applySnapshot(msg *raft.ApplyMsg) {
 	kv.readSnapshot(msg.Snapshot)
+	kv.lastCommandIndex = msg.SnapshotIndex
+	kv.logReplayOverheadBytes = 0
 }
 
 func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
@@ -159,30 +172,18 @@ func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
 	if rId, exist := kv.lastRequestId[op.ClientId]; exist && rId == op.RequestId {
 		return
 	}
-	// after the command apply, there are 3 parts change in state machine
-	// part1. the map storage key value pairs
-	// part2. the map storage the id of most recent request of a client.
-	// part3. the map storage most recent response of a client's request.
-	// part4. the log entry in raft.
-	var part1, part2, part3, part4 int
-	if op.Method == APPEND {
+	switch op.Method {
+	case APPEND:
 		op.Err = OK
 		if val, exist := kv.stateMachine[op.Key]; exist {
 			kv.stateMachine[op.Key] = val + op.Value
 		} else {
 			kv.stateMachine[op.Key] = op.Value
 		}
-		part1 = int(unsafe.Sizeof(op.Value))
-	} else if op.Method == PUT {
-		if oldValue, exist := kv.stateMachine[op.Key]; exist {
-			part1 = int(unsafe.Sizeof(oldValue)) - int(unsafe.Sizeof(op.Value))
-		} else {
-			part1 = int(unsafe.Sizeof(op.Value))
-		}
+	case PUT:
 		kv.stateMachine[op.Key] = op.Value
 		op.Err = OK
-
-	} else if op.Method == GET {
+	case GET:
 		if val, exist := kv.stateMachine[op.Key]; exist {
 			op.Err = OK
 			op.Value = val
@@ -190,33 +191,14 @@ func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
 			op.Err = ErrNoKey
 			op.Value = ""
 		}
-		part1 = 0
+	default:
+		log.Printf("warning: unknown command %+v\n", msg)
 	}
 
-	if cId, exist := kv.lastRequestId[op.ClientId]; exist {
-		part2 = int(unsafe.Sizeof(cId)) - int(unsafe.Sizeof(op.ClientId))
-	} else {
-		part2 = int(unsafe.Sizeof(op.ClientId))
-	}
 	kv.lastRequestId[op.ClientId] = op.RequestId
-
-	if oldOp, exist := kv.lastResponse[op.ClientId]; exist {
-		part3 = int(unsafe.Sizeof(oldOp)) - int(unsafe.Sizeof(op))
-	} else {
-		part3 = int(unsafe.Sizeof(op))
-	}
 	kv.lastResponse[op.ClientId] = op
 
-	part4 = int(unsafe.Sizeof(msg))
-	kv.logReplayOverheadBytes += part1 + part2 + part3 + part4
 	// log.Printf("server:%d apply command %d, detail %+v  \n", kv.me, msg.CommandIndex, op)
-}
-
-func (kv *KVServer) getStateSizeBytes() int {
-	mpaSize := unsafe.Sizeof(kv.stateMachine)
-	clientSize := unsafe.Sizeof(kv.lastRequestId)
-	responseSize := unsafe.Sizeof(kv.lastResponse)
-	return int(mpaSize) + int(clientSize) + int(responseSize)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -233,13 +215,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if lastRid, exist := kv.lastRequestId[args.ClientId]; exist && lastRid == args.RequestId {
 		op, exist := kv.lastResponse[args.ClientId]
 		kv.mu.Unlock()
-		if !exist {
-			kv.waitPutAppendReply(args, reply)
-		} else {
+		if exist {
 			reply.Err = op.Err
-			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
+			return
 		}
-		return
 	}
 	putAppendOp := Op{
 		Key:       args.Key,
@@ -366,15 +345,13 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	}
 }
 
-func (kv *KVServer) writeSnapshot(lastIncluded int) {
+func (kv *KVServer) getStateMachineBytes() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.stateMachine)
 	e.Encode(kv.lastRequestId)
 	e.Encode(kv.lastResponse)
-	raftstate := w.Bytes()
-	kv.rf.Snapshot(lastIncluded, raftstate)
-	kv.logReplayOverheadBytes = 0
+	return w.Bytes()
 }
 
 func (kv *KVServer) printStateMachine() {

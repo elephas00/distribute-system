@@ -228,6 +228,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		snapshot := rf.persister.ReadSnapshot()
 		rf.persistState.snapshot = snapshot
 		msg := ApplyMsg{
+			CommandValid:  false,
 			SnapshotValid: true,
 			Snapshot:      snapshot,
 			SnapshotIndex: rf.persistState.lastIncludedIndex,
@@ -238,7 +239,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// rf.printServerStartInfo()
 
-	// start ticker goroutine to start elections	
+	// start ticker goroutine to start elections
 	go func() {
 		rf.electionTimeoutTicker()
 	}()
@@ -402,7 +403,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// log.Printf("%s %d, term %d, called snapshot(), index %d, oldlastIndex %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, rf.persistState.lastIncludedIndex)
 	if index < rf.persistState.lastIncludedIndex || index > rf.getLastLogIndex() {
 		message := "warning: %s:%d, term:%d, trying to access index:%d, lastIncludedInex:%d, commit:%d\n"
-		log.Printf(message, serverStates[rf.serverState], rf.me, index, rf.persistState.term, rf.persistState.lastIncludedIndex, rf.volatileState.commitIndex)
+		log.Printf(message, serverStates[rf.serverState], rf.me, rf.persistState.term, index, rf.persistState.lastIncludedIndex, rf.volatileState.commitIndex)
 		return
 	}
 	lastIndexInLog := rf.toRelativeIndex(index)
@@ -442,7 +443,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.persist()
 	// log.Printf("%s %d, term %d, after snapshot() \n", serverStates[rf.serverState], rf.me, rf.persistState.term)
-	rf.printCommitLogs()
+	// rf.printCommitLogs()
 
 }
 
@@ -474,7 +475,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.volatileState.lastApplied = args.LastIncludedIndex
 	rf.volatileState.commitIndex = args.LastIncludedIndex
 	rf.persist()
-	// log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
+	log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
+	rf.printCommitLogs()
 }
 
 func (rf *Raft) updateCommit(args *AppendEntriesArgs) {
@@ -827,7 +829,7 @@ func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int) {
 		args.PrevLogIndex = rf.persistState.lastIncludedIndex
 		args.PrevLogTerm = rf.getLog(args.PrevLogIndex).Term
 		args.Entries = rf.persistState.logs[1:]
-		log.Printf("leader call append entries, args: %+v", args)
+		// log.Printf("leader call append entries, args: %+v", args)
 	}
 }
 
