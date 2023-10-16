@@ -234,13 +234,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			SnapshotTerm:  rf.persistState.lastIncludedTerm,
 		}
 		rf.volatileState.appliedMsgCacheChan <- msg
-		// go func(ch chan ApplyMsg, m ApplyMsg) {
-		// 	ch <- m
-		// }(rf.applyCh, msg)
 	}
-	// start ticker goroutine to start elections
+
 	// rf.printServerStartInfo()
 
+	// start ticker goroutine to start elections	
 	go func() {
 		rf.electionTimeoutTicker()
 	}()
@@ -402,6 +400,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// log.Printf("%s %d, term %d, called snapshot(), index %d, oldlastIndex %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, index, rf.persistState.lastIncludedIndex)
+	if index < rf.persistState.lastIncludedIndex || index > rf.getLastLogIndex() {
+		message := "warning: %s:%d, term:%d, trying to access index:%d, lastIncludedInex:%d, commit:%d\n"
+		log.Printf(message, serverStates[rf.serverState], rf.me, index, rf.persistState.term, rf.persistState.lastIncludedIndex, rf.volatileState.commitIndex)
+		return
+	}
 	lastIndexInLog := rf.toRelativeIndex(index)
 	rf.persistState.logs = rf.persistState.logs[lastIndexInLog:]
 	newLogs := make([]Log, len(rf.persistState.logs))
@@ -559,7 +562,12 @@ func (rf *Raft) getLog(absoluteIndex int) Log {
 }
 
 func (rf *Raft) toRelativeIndex(index int) int {
-	return index - rf.persistState.lastIncludedIndex
+	relativeIndex := index - rf.persistState.lastIncludedIndex
+	if relativeIndex < 0 {
+		message := "%s:%d, term:%d, failed to access index:%d, lastIncludedInex:%d\n"
+		log.Printf(message, serverStates[rf.serverState], rf.me, index, rf.persistState.term, rf.persistState.lastIncludedIndex)
+	}
+	return relativeIndex
 }
 
 func (rf *Raft) convertToFollower() {
@@ -804,7 +812,7 @@ func (rf *Raft) prepareAppendEntriesArgs(args *AppendEntriesArgs, server int) {
 		args.Entries = []Log{}
 
 		// log.Printf("branch1, next index %d, last log index %d, leader logs: %v, args: %+v\n",nextIdx, lastLogIdx, rf.persistState.logs, args)
-	} else if nextIdx >= rf.persistState.lastIncludedIndex {
+	} else if nextIdx > rf.persistState.lastIncludedIndex {
 		// there are new logs send to followers
 		prevLogIndex := nextIdx - 1
 		args.PrevLogIndex = prevLogIndex
@@ -899,7 +907,10 @@ func (rf *Raft) doAppendEntries(server int, term int, retry int) {
 func (rf *Raft) msgApplier() {
 	for {
 		msg := <-rf.volatileState.appliedMsgCacheChan
-
+		if msg.CommandValid && msg.CommandIndex < rf.persistState.lastIncludedIndex || msg.CommandIndex > rf.getLastLogIndex() {
+			message := "warning: %s %d, term:%d, try to send a illegal message %+v\n"
+			log.Printf(message, serverStates[rf.serverState], rf.me, rf.persistState.term, msg)
+		}
 		// if msg.SnapshotValid {
 		// 	rf.mu.Lock()
 		// 	rf.volatileState.appliedMsgCacheChan = make(chan ApplyMsg, 20)
@@ -1131,8 +1142,8 @@ func (rf *Raft) notContainsMatchPrevLog(args *AppendEntriesArgs) bool {
 }
 
 func (rf *Raft) printCommitLogs() {
-	p := "%s %d (term: %d), commitIndex %d, logs: ["
-	message := fmt.Sprintf(p, serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex)
+	p := "%s %d (term: %d), commitIndex %d, lastIncluded %d, logs: ["
+	message := fmt.Sprintf(p, serverStates[rf.serverState], rf.me, rf.persistState.term, rf.volatileState.commitIndex, rf.persistState.lastIncludedIndex)
 	var builder strings.Builder
 	builder.WriteString(message)
 	logPattern := "%d:%d"

@@ -7,6 +7,10 @@ const (
 )
 
 const (
+	NO_SNAPSHOT = -1
+)
+
+const (
 	APPEND = "Append"
 	PUT    = "Put"
 	GET    = "Get"

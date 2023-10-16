@@ -1,12 +1,14 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -41,12 +43,13 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
-
+	maxraftstate           int // snapshot if log grows this big
+	logReplayOverheadBytes int
 	// Your definitions here.
 	stateMachine  map[string]string
 	lastRequestId map[int]int
 	lastResponse  map[int]Op
+	persister     *raft.Persister
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -117,13 +120,29 @@ func (kv *KVServer) waitGetReply(args *GetArgs, reply *GetReply) {
 	}
 }
 
+func (kv *KVServer) getRaftSize() int {
+	return kv.logReplayOverheadBytes
+}
+
 func (kv *KVServer) applier() {
 	for {
 		msg := <-kv.applyCh
 		kv.mu.Lock()
-		kv.applyMsg(&msg)
+		if msg.CommandValid {
+			kv.applyMsg(&msg)
+		}
+		if msg.SnapshotValid {
+			kv.applySnapshot(&msg)
+		}
+		if kv.maxraftstate != NO_SNAPSHOT && kv.getRaftSize() > kv.maxraftstate {
+			kv.writeSnapshot(msg.CommandIndex)
+		}
 		kv.mu.Unlock()
 	}
+}
+
+func (kv *KVServer) applySnapshot(msg *raft.ApplyMsg) {
+	kv.readSnapshot(msg.Snapshot)
 }
 
 func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
@@ -133,37 +152,71 @@ func (kv *KVServer) applyMsg(msg *raft.ApplyMsg) {
 	}
 	op, ok := msg.Command.(Op)
 	if !ok {
-		// log.Printf("COMMAND is not operation")
+		log.Printf("warning: command is not operation, %+v", op)
 		return
 	}
 	// duplicate request
 	if rId, exist := kv.lastRequestId[op.ClientId]; exist && rId == op.RequestId {
 		return
 	}
+	// after the command apply, there are 3 parts change in state machine
+	// part1. the map storage key value pairs
+	// part2. the map storage the id of most recent request of a client.
+	// part3. the map storage most recent response of a client's request.
+	// part4. the log entry in raft.
+	var part1, part2, part3, part4 int
 	if op.Method == APPEND {
-		val, exist := kv.stateMachine[op.Key]
 		op.Err = OK
-		if exist {
+		if val, exist := kv.stateMachine[op.Key]; exist {
 			kv.stateMachine[op.Key] = val + op.Value
 		} else {
 			kv.stateMachine[op.Key] = op.Value
 		}
+		part1 = int(unsafe.Sizeof(op.Value))
 	} else if op.Method == PUT {
+		if oldValue, exist := kv.stateMachine[op.Key]; exist {
+			part1 = int(unsafe.Sizeof(oldValue)) - int(unsafe.Sizeof(op.Value))
+		} else {
+			part1 = int(unsafe.Sizeof(op.Value))
+		}
 		kv.stateMachine[op.Key] = op.Value
 		op.Err = OK
+
 	} else if op.Method == GET {
-		val, exist := kv.stateMachine[op.Key]
-		if exist {
+		if val, exist := kv.stateMachine[op.Key]; exist {
 			op.Err = OK
 			op.Value = val
 		} else {
 			op.Err = ErrNoKey
 			op.Value = ""
 		}
+		part1 = 0
+	}
+
+	if cId, exist := kv.lastRequestId[op.ClientId]; exist {
+		part2 = int(unsafe.Sizeof(cId)) - int(unsafe.Sizeof(op.ClientId))
+	} else {
+		part2 = int(unsafe.Sizeof(op.ClientId))
 	}
 	kv.lastRequestId[op.ClientId] = op.RequestId
+
+	if oldOp, exist := kv.lastResponse[op.ClientId]; exist {
+		part3 = int(unsafe.Sizeof(oldOp)) - int(unsafe.Sizeof(op))
+	} else {
+		part3 = int(unsafe.Sizeof(op))
+	}
 	kv.lastResponse[op.ClientId] = op
+
+	part4 = int(unsafe.Sizeof(msg))
+	kv.logReplayOverheadBytes += part1 + part2 + part3 + part4
 	// log.Printf("server:%d apply command %d, detail %+v  \n", kv.me, msg.CommandIndex, op)
+}
+
+func (kv *KVServer) getStateSizeBytes() int {
+	mpaSize := unsafe.Sizeof(kv.stateMachine)
+	clientSize := unsafe.Sizeof(kv.lastRequestId)
+	responseSize := unsafe.Sizeof(kv.lastResponse)
+	return int(mpaSize) + int(clientSize) + int(responseSize)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -268,6 +321,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 	kv := new(KVServer)
+	// kv.readSnapshot(persister.ReadSnapshot())
+
 	kv.mu.Lock()
 	kv.me = me
 	kv.maxraftstate = maxraftstate
@@ -278,12 +333,48 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.persister = persister
 	kv.stateMachine = make(map[string]string)
 	kv.lastRequestId = make(map[int]int)
 	kv.lastResponse = make(map[int]Op)
 	kv.mu.Unlock()
 	go kv.applier()
 	return kv
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var stateMachine map[string]string
+	var lastRequestId map[int]int
+	var lastResponse map[int]Op
+
+	if d.Decode(&stateMachine) != nil ||
+		d.Decode(&lastRequestId) != nil ||
+		d.Decode(&lastResponse) != nil {
+		log.Printf("warning: %d read persist failed", kv.me)
+	} else {
+		kv.stateMachine = stateMachine
+		kv.lastRequestId = lastRequestId
+		kv.lastResponse = lastResponse
+	}
+}
+
+func (kv *KVServer) writeSnapshot(lastIncluded int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.lastRequestId)
+	e.Encode(kv.lastResponse)
+	raftstate := w.Bytes()
+	kv.rf.Snapshot(lastIncluded, raftstate)
+	kv.logReplayOverheadBytes = 0
 }
 
 func (kv *KVServer) printStateMachine() {
