@@ -61,10 +61,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	ok := kv.mu.TryLock()
-	if !ok {
-		return
-	}
+	kv.mu.Lock()
 	if lastRid, exist := kv.lastRequestId[args.ClientId]; exist && lastRid == args.RequestId {
 		op, exist := kv.lastResponse[args.ClientId]
 		kv.mu.Unlock()
@@ -97,11 +94,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) waitGetReply(args *GetArgs, reply *GetReply) {
 	for i := 0; i < 10; i++ {
-		ok := kv.mu.TryLock()
-		if !ok {
-			time.Sleep(time.Millisecond * 10)
-			continue
-		}
+		kv.mu.Lock()
 		rId, exist := kv.lastRequestId[args.ClientId]
 		if exist && rId == args.RequestId {
 			resp := kv.lastResponse[args.ClientId]
@@ -207,11 +200,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	ok := kv.mu.TryLock()
-	if !ok {
-		return
-	}
-
+	kv.mu.Lock()
 	if lastRid, exist := kv.lastRequestId[args.ClientId]; exist && lastRid == args.RequestId {
 		op, exist := kv.lastResponse[args.ClientId]
 		kv.mu.Unlock()
@@ -244,11 +233,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) waitPutAppendReply(args *PutAppendArgs, reply *PutAppendReply) {
 	for i := 0; i < 10; i++ {
-		ok := kv.mu.TryLock()
-		if !ok {
-			time.Sleep(time.Millisecond * 10)
-			continue
-		}
+		kv.mu.Lock()
 		rId, exist := kv.lastRequestId[args.ClientId]
 		// log.Printf("server %d, lastRequestId %d, args.RequestId %d \n", kv.me, rId, args.RequestId)
 		if exist && rId == args.RequestId {
