@@ -458,6 +458,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	if args.LastIncludedIndex < rf.persistState.lastIncludedIndex {
+		return
+	}
 	if args.Term > rf.persistState.term {
 		rf.persistState.term = args.Term
 	}
@@ -909,26 +912,12 @@ func (rf *Raft) doAppendEntries(server int, term int, retry int) {
 func (rf *Raft) msgApplier() {
 	for {
 		msg := <-rf.volatileState.appliedMsgCacheChan
+		rf.mu.RLock()
 		if msg.CommandValid && msg.CommandIndex < rf.persistState.lastIncludedIndex || msg.CommandIndex > rf.getLastLogIndex() {
 			message := "warning: %s %d, term:%d, try to send a illegal message %+v\n"
 			log.Printf(message, serverStates[rf.serverState], rf.me, rf.persistState.term, msg)
 		}
-		// if msg.SnapshotValid {
-		// 	rf.mu.Lock()
-		// 	rf.volatileState.appliedMsgCacheChan = make(chan ApplyMsg, 20)
-		// 	for _, log := range rf.persistState.logs {
-		// 		if log.Index > msg.SnapshotIndex && log.Index <= rf.volatileState.commitIndex {
-		// 			rf.volatileState.appliedMsgCacheChan <- ApplyMsg{
-		// 				CommandIndex: log.Index,
-		// 				Command:      log.Command,
-		// 				CommandValid: true,
-		// 			}
-		// 		} else {
-		// 			break
-		// 		}
-		// 	}
-		// 	rf.mu.Unlock()
-		// }
+		rf.mu.RUnlock()
 		rf.applyCh <- msg
 
 	}
