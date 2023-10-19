@@ -559,17 +559,17 @@ func (sc *ShardCtrler) applyMsg(msg *raft.ApplyMsg) {
 
 		newConfig.Shards = sc.distributeShardJoin(newConfig)
 		sc.configs = append(sc.configs, newConfig)
-		if _, isLeader := sc.rf.GetState(); isLeader {
-			log.Println()
-			log.Printf("args: %+v\n", args)
-			sc.printConfig(latestConfig)
-			sc.printConfig(newConfig)
-		} else {
-			log.Println()
-			log.Printf("args: %+v\n", args)
-			sc.printConfig(latestConfig)
-			sc.printConfig(newConfig)
-		}
+		// if _, isLeader := sc.rf.GetState(); isLeader {
+		// 	log.Println()
+		// 	log.Printf("args: %+v\n", args)
+		// 	sc.printConfig(latestConfig)
+		// 	sc.printConfig(newConfig)
+		// } else {
+		// 	log.Println()
+		// 	log.Printf("args: %+v\n", args)
+		// 	sc.printConfig(latestConfig)
+		// 	sc.printConfig(newConfig)
+		// }
 
 		reply := JoinReply{
 			WrongLeader: false,
@@ -607,17 +607,17 @@ func (sc *ShardCtrler) applyMsg(msg *raft.ApplyMsg) {
 		}
 
 		sc.configs = append(sc.configs, newConfig)
-		if _, isLeader := sc.rf.GetState(); isLeader {
-			log.Println()
-			log.Printf("args: %+v\n", args)
-			sc.printConfig(latestConfig)
-			sc.printConfig(newConfig)
-		} else {
-			log.Println()
-			log.Printf("args: %+v\n", args)
-			sc.printConfig(latestConfig)
-			sc.printConfig(newConfig)
-		}
+		// if _, isLeader := sc.rf.GetState(); isLeader {
+		// 	log.Println()
+		// 	log.Printf("args: %+v\n", args)
+		// 	sc.printConfig(latestConfig)
+		// 	sc.printConfig(newConfig)
+		// } else {
+		// 	log.Println()
+		// 	log.Printf("args: %+v\n", args)
+		// 	sc.printConfig(latestConfig)
+		// 	sc.printConfig(newConfig)
+		// }
 		reply := LeaveReply{
 			WrongLeader: false,
 			Err:         OK,
@@ -660,15 +660,15 @@ func (sc *ShardCtrler) applyMsg(msg *raft.ApplyMsg) {
 			reply.Config = sc.configs[args.Num]
 		}
 		op.Reply = reply
-		if _, isLeader := sc.rf.GetState(); isLeader {
-			log.Println()
-			log.Printf("query args: %+v\n", args)
-			sc.printConfig(reply.Config)
-		} else {
-			log.Println()
-			log.Printf("query args: %+v\n", args)
-			sc.printConfig(reply.Config)
-		}
+		// if _, isLeader := sc.rf.GetState(); isLeader {
+		// 	log.Println()
+		// 	log.Printf("query args: %+v\n", args)
+		// 	sc.printConfig(reply.Config)
+		// } else {
+		// 	log.Println()
+		// 	log.Printf("query args: %+v\n", args)
+		// 	sc.printConfig(reply.Config)
+		// }
 	default:
 		log.Printf("warning: unknown command %+v\n", msg)
 	}
