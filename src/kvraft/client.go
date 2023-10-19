@@ -64,9 +64,9 @@ func (ck *Clerk) Get(key string) string {
 		}
 		// log.Printf(" get req begin %+v \n", args)
 		for i := range ck.servers {
-			go ck.makeGetCall(i, &success, &args, &waitGroup, &value)
+			ck.makeGetCall(i, &success, &args, &waitGroup, &value)
 		}
-		waitGroup.Wait()
+		// waitGroup.Wait()
 		if success {
 			break
 		} else {
@@ -124,9 +124,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		// log.Printf(" put append req begin %+v \n", args)
 		for i := range ck.servers {
-			go ck.makePutAppendCall(i, &success, &args, &waitGroup)
+			ck.makePutAppendCall(i, &success, &args, &waitGroup)
 		}
-		waitGroup.Wait()
+		// waitGroup.Wait()
 		if success {
 			break
 		} else {
@@ -138,7 +138,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 }
 
 func (ck *Clerk) makePutAppendCall(server int, success *bool, args *PutAppendArgs, wg *sync.WaitGroup) {
-	defer wg.Done()
+	// defer wg.Done()
 	reply := PutAppendReply{}
 	// log.Printf("client %d, send put append request to server %d, args:%+v\n", ck.id, server, args)
 	ok := ck.servers[server].Call("KVServer.PutAppend", args, &reply)
