@@ -72,10 +72,15 @@ func (ck *Clerk) Get(key string) string {
 	args.ClientId = ck.id
 	args.RequestId = int(atomic.AddInt64(&ck.lastRequestId, 1))
 	args.Key = key
-
+	args.ConfigNum = ck.config.Num
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		if ck.config.Num != args.ConfigNum {
+			args.ConfigNum = ck.config.Num
+			// newReqId := int(atomic.AddInt64(&ck.lastRequestId, 1))
+			// args.RequestId = newReqId
+		}
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
@@ -108,10 +113,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
+	args.ConfigNum = ck.config.Num
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		if ck.config.Num != args.ConfigNum {
+			args.ConfigNum = ck.config.Num
+			// newReqId := int(atomic.AddInt64(&ck.lastRequestId, 1))
+			// args.RequestId = newReqId
+		}
+		// log.Printf("client %d, request %d, key:%s, config said gid is %d, config num is %d\n", ck.id, args.RequestId, args.Key, gid, ck.config.Num)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
