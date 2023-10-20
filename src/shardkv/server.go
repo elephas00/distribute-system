@@ -186,7 +186,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	if args.ConfigNum != kv.config.Num {
 		reply.Err = ErrWrongGroup
-		log.Printf("wrong config num %d, now %d\n", args.ConfigNum, kv.config.Num)
+		// log.Printf("wrong config num %d, now %d\n", args.ConfigNum, kv.config.Num)
 		kv.mu.Unlock()
 		return
 	}
@@ -202,6 +202,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		if exist {
 			reply.Err = resp.Err
 			reply.Value = resp.Value
+			// log.Printf("group %d, server %d, num %d, shards:%+v, already finish request, args key:%s, shard:%d, reply:%+v， args%+v \n", kv.gid, kv.me, kv.config.Num, kv.currentShards, args.Key, key2shard(args.Key), reply, args)
 			kv.mu.Unlock()
 			return
 		}
@@ -248,7 +249,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	if args.ConfigNum != kv.config.Num {
 		reply.Err = ErrWrongGroup
-		log.Printf("wrong config num %d, now %d\n", args.ConfigNum, kv.config.Num)
+		// log.Printf("wrong config num %d, now %d\n", args.ConfigNum, kv.config.Num)
 		kv.mu.Unlock()
 		return
 	}
@@ -264,7 +265,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		resp, exist := kv.lastResponse[args.ClientId].Reply.(PutAppendReply)
 		if exist {
 			reply.Err = resp.Err
-			log.Printf("group %d, server %d, num %d, shards:%+v, already finish request, args key:%s, reply:%+v， args%+v \n", kv.gid, kv.me, kv.config.Num, kv.currentShards, args.Key, reply, args)
+			// log.Printf("group %d, server %d, num %d, shards:%+v, already finish request, args key:%s, shard:%d, reply:%+v， args%+v \n", kv.gid, kv.me, kv.config.Num, kv.currentShards, args.Key, key2shard(args.Key), reply, args)
 			kv.mu.Unlock()
 			return
 		}
@@ -539,6 +540,9 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 	}
 	switch op.Method {
 	case MethodAppend:
+		if kv.configChanging {
+			return
+		}
 		args := op.Args.(PutAppendArgs)
 		reply := PutAppendReply{}
 		if kv.isValidKey(args.Key) {
@@ -555,10 +559,13 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 			reply.Err = ErrWrongGroup
 		}
 		if _, isLeader := kv.rf.GetState(); isLeader {
-			log.Printf("group %d, server %d, num %d, append command finish, args: %+v\n", kv.gid, kv.me, kv.config.Num, args)
+			log.Printf("group %d, server %d, num %d, append command %d finish, args:%+v, reply:%+v, previous response:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args, reply, kv.lastResponse[op.ClientId])
 		}
 		op.Reply = reply
 	case MethodPut:
+		if kv.configChanging {
+			return
+		}
 		args := op.Args.(PutAppendArgs)
 		reply := PutAppendReply{}
 		if kv.isValidKey(args.Key) {
@@ -571,10 +578,13 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 			}
 		}
 		if _, isLeader := kv.rf.GetState(); isLeader {
-			log.Printf("group %d, server %d, num %d, put command finish, args: %+v\n", kv.gid, kv.me, kv.config.Num, args)
+			log.Printf("group %d, server %d, num %d, put command %d finish, args:%+v, reply:%+v, previous response:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args, reply, kv.lastResponse[op.ClientId])
 		}
 		op.Reply = reply
 	case MethodGet:
+		if kv.configChanging {
+			return
+		}
 		args := op.Args.(GetArgs)
 		reply := GetReply{}
 		if kv.isValidKey(args.Key) {
@@ -592,7 +602,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 			}
 		}
 		if _, isLeader := kv.rf.GetState(); isLeader {
-			log.Printf("group %d, server %d, num %d, get command finish, args: %+v\n", kv.gid, kv.me, kv.config.Num, args)
+			log.Printf("group %d, server %d, num %d, get command %d finish, args:%+v, reply:%+v, previous response:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args, reply, kv.lastResponse[op.ClientId])
 		}
 		op.Reply = reply
 	case MethodConfigChange:
@@ -687,28 +697,26 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		for _, shard := range args.Shards {
 			kv.currentShards[shard] = VOID_MEMEBER
 		}
-		for k, v := range args.Data {
+		for k, v := range args.KeyValueData {
 			kv.stateMachine[k] = v
+		}
+		for k, v := range args.LastResponse {
+			rId, exist := kv.lastRequestId[k]
+			if !exist || rId < v.RequestId {
+				log.Printf("group %d, leader %d, num: %d, receive shard, clientId: %d, op:%+v, previousOp:%+v\n", kv.gid, kv.me, kv.config.Num, k, v, kv.lastResponse[k])
+				kv.lastResponse[k] = v
+				kv.lastRequestId[k] = v.RequestId
+			}
 		}
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			log.Printf("group %d, leader %d, num: %d, receive shards: %+v, given:%+v, now:%+v, args:%+v\n", kv.gid, kv.me, kv.config.Num, args.Shards, kv.getGivenShards(), kv.currentShards, args)
 		}
-
 		op.Reply = ShardsAddReply{Err: OK}
 	default:
 		log.Printf("warning: unknown command %+v\n", msg)
 	}
-	// if _, isLeader := kv.rf.GetState(); isLeader {
-	// 	log.Printf("last response change before :%+v \n", kv.lastResponse)
-	// }
-
 	kv.lastRequestId[op.ClientId] = op.RequestId
 	kv.lastResponse[op.ClientId] = op
-	// if _, isLeader := kv.rf.GetState(); isLeader {
-	// 	log.Printf("last response change after :%+v \n", kv.lastResponse)
-	// }
-
-	// log.Printf("server:%d apply command %d, detail %+v  \n", kv.me, msg.CommandIndex, op)
 }
 
 func (kv *ShardKV) configMaintainer() {
@@ -806,12 +814,12 @@ func (kv *ShardKV) shardsTranferRoutine() {
 				}
 			}
 			args := ShardsAddArgs{
-				ClientId:  kv.gid,
-				RequestId: kv.config.Num,
-				GID:       kv.gid,
-				Config:    kv.config,
-				Shards:    shards,
-				Data:      data,
+				ClientId:     kv.gid,
+				RequestId:    kv.config.Num,
+				GID:          kv.gid,
+				Config:       kv.config,
+				Shards:       shards,
+				KeyValueData: data,
 			}
 			servers := kv.config.Groups[gid]
 			for si := 0; si < len(servers); si++ {
@@ -937,6 +945,7 @@ func (kv *ShardKV) moveOutShards() {
 	leaveShards := kv.getLeaveShards()
 	for gid, shards := range leaveShards {
 		data := make(map[string]string)
+		lastResponse := make(map[int]Op)
 		for k, v := range kv.stateMachine {
 			shard := key2shard(k)
 			for _, s := range shards {
@@ -945,13 +954,42 @@ func (kv *ShardKV) moveOutShards() {
 				}
 			}
 		}
+		for clientId, resp := range kv.lastResponse {
+			switch args := resp.Args.(type) {
+			case GetArgs:
+				shard := key2shard(args.Key)
+				find := false
+				for i := 0; i < len(shards); i++ {
+					if shards[i] == shard {
+						find = true
+					}
+
+				}
+				if find {
+					lastResponse[clientId] = resp
+				}
+			case PutAppendArgs:
+				shard := key2shard(args.Key)
+				find := false
+				for i := 0; i < len(shards); i++ {
+					if shards[i] == shard {
+						find = true
+					}
+
+				}
+				if find {
+					lastResponse[clientId] = resp
+				}
+			}
+		}
 		args := ShardsAddArgs{
-			ClientId:  kv.gid,
-			RequestId: kv.config.Num,
-			GID:       kv.gid,
-			Config:    kv.config,
-			Shards:    shards,
-			Data:      data,
+			ClientId:     kv.gid,
+			RequestId:    kv.config.Num,
+			GID:          kv.gid,
+			Config:       kv.config,
+			Shards:       shards,
+			KeyValueData: data,
+			LastResponse: lastResponse,
 		}
 		servers := kv.config.Groups[gid]
 		success := false

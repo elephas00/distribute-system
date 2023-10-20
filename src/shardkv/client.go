@@ -78,15 +78,15 @@ func (ck *Clerk) Get(key string) string {
 		gid := ck.config.Shards[shard]
 		if ck.config.Num != args.ConfigNum {
 			args.ConfigNum = ck.config.Num
-			// newReqId := int(atomic.AddInt64(&ck.lastRequestId, 1))
-			// args.RequestId = newReqId
 		}
+		// log.Printf("client %d, get request %d, key:%s, config said gid is %d, config num is %d\n", ck.id, args.RequestId, args.Key, gid, ck.config.Num)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+				// log.Printf("get reply %+v\n", reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
@@ -119,15 +119,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		gid := ck.config.Shards[shard]
 		if ck.config.Num != args.ConfigNum {
 			args.ConfigNum = ck.config.Num
-			// newReqId := int(atomic.AddInt64(&ck.lastRequestId, 1))
-			// args.RequestId = newReqId
 		}
-		// log.Printf("client %d, request %d, key:%s, config said gid is %d, config num is %d\n", ck.id, args.RequestId, args.Key, gid, ck.config.Num)
+		// log.Printf("client %d, put append request %d, key:%s, config said gid is %d, config num is %d\n", ck.id, args.RequestId, args.Key, gid, ck.config.Num)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				// log.Printf("put append reply %+v\n", reply)
 				if ok && reply.Err == OK {
 					return
 				}

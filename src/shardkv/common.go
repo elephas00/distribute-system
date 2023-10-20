@@ -66,12 +66,13 @@ type ConfigChangeReply struct {
 }
 
 type ShardsAddArgs struct {
-	ClientId  int
-	RequestId int
-	GID       int
-	Config    shardctrler.Config
-	Shards    []int
-	Data      map[string]string
+	ClientId     int
+	RequestId    int
+	GID          int
+	Config       shardctrler.Config
+	Shards       []int
+	KeyValueData map[string]string
+	LastResponse map[int]Op
 }
 
 type ShardsAddReply struct {
