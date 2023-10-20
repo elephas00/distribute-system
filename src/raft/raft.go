@@ -478,8 +478,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.volatileState.lastApplied = args.LastIncludedIndex
 	rf.volatileState.commitIndex = args.LastIncludedIndex
 	rf.persist()
-	log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
-	rf.printCommitLogs()
+	// log.Printf("%s %d, term %d, after called install snapshot(), leader is %d, term is %d \n", serverStates[rf.serverState], rf.me, rf.persistState.term, args.LeaderId, args.Term)
+	// rf.printCommitLogs()
 }
 
 func (rf *Raft) updateCommit(args *AppendEntriesArgs) {
