@@ -2,6 +2,8 @@ package shardkv
 
 import (
 	"bytes"
+	"compress/gzip"
+	"io/ioutil"
 	"log"
 	"sync"
 	"time"
@@ -35,7 +37,7 @@ type void struct {
 var VOID_MEMEBER void
 
 type ShardKV struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -66,28 +68,29 @@ func (kv *ShardKV) ShardsAdd(args *ShardsAddArgs, reply *ShardsAddReply) {
 		return
 	}
 
-	kv.mu.Lock()
+	kv.mu.RLock()
 	if _, isLeader := kv.rf.GetState(); !isLeader {
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	if kv.config.Num > args.Config.Num {
 		reply.Err = OK
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	if kv.config.Num < args.Config.Num {
+		log.Printf("group %d, server %d, num %d, shards:%+v, reject shards add request gid:%d, num:%d, shards:%+v\n", kv.gid, kv.me, kv.config.Num, kv.currentShards, args.GID, args.Config.Num, args.Shards)
 		reply.Err = ErrWrongGroup
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	if !kv.configChanging && args.Config.Num == kv.config.Num {
 		reply.Err = OK
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
@@ -95,7 +98,7 @@ func (kv *ShardKV) ShardsAdd(args *ShardsAddArgs, reply *ShardsAddReply) {
 		resp, exist := kv.lastResponse[args.ClientId].Reply.(ShardsAddReply)
 		if exist {
 			reply.Err = resp.Err
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		}
 	}
@@ -110,11 +113,11 @@ func (kv *ShardKV) ShardsAdd(args *ShardsAddArgs, reply *ShardsAddReply) {
 	_, _, isLeader := kv.rf.Start(shardsAddOp)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 	// log.Printf("leader %d receive command: %d, requestId:%d, clientId:%d\n", kv.me, index, args.RequestId, args.ClientId)
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 	kv.waitShardsAddReply(args, reply)
 }
 
@@ -124,22 +127,22 @@ func (kv *ShardKV) ShardsRemove(args *ShardsRemoveArgs, reply *ShardsRemoveReply
 		return
 	}
 
-	kv.mu.Lock()
+	kv.mu.RLock()
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	if args.Config.Num < kv.config.Num {
 		reply.Err = OK
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	if args.Config.Num > kv.config.Num {
 		reply.Err = ErrWrongGroup
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
@@ -147,7 +150,7 @@ func (kv *ShardKV) ShardsRemove(args *ShardsRemoveArgs, reply *ShardsRemoveReply
 		resp, exist := kv.lastResponse[args.ClientId].Reply.(ShardsRemoveReply)
 		if exist {
 			reply.Err = resp.Err
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		}
 	}
@@ -163,11 +166,11 @@ func (kv *ShardKV) ShardsRemove(args *ShardsRemoveArgs, reply *ShardsRemoveReply
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 	// log.Printf("leader %d receive command: %d, requestId:%d, clientId:%d\n", kv.me, index, args.RequestId, args.ClientId)
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 	kv.waitShardsRemoveReply(args, reply)
 }
 
@@ -177,10 +180,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	kv.mu.Lock()
+	kv.mu.RLock()
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		// log.Println("WRONG LEADER")
 		return
 	}
@@ -188,12 +191,12 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	if args.ConfigNum != kv.config.Num {
 		reply.Err = ErrWrongGroup
 		// log.Printf("wrong config num %d, now %d\n", args.ConfigNum, kv.config.Num)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	if kv.configChanging && kv.isForbbidenOpWhenConfigChanging(args.Key) {
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
@@ -203,7 +206,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = resp.Err
 			reply.Value = resp.Value
 			// log.Printf("group %d, server %d, num %d, shards:%+v, already finish request, args key:%s, shard:%d, reply:%+v， args%+v \n", kv.gid, kv.me, kv.config.Num, kv.currentShards, args.Key, key2shard(args.Key), reply, args)
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		}
 	}
@@ -219,11 +222,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 	// log.Printf("leader %d receive command: %d, requestId:%d, clientId:%d\n", kv.me, index, args.RequestId, args.ClientId)
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 	kv.waitGetReply(args, reply)
 }
 
@@ -238,11 +241,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	kv.mu.Lock()
+	kv.mu.RLock()
 	// log.Println("receive PUT APPEND")
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		// log.Println("WRONG LEADER")
 		return
 	}
@@ -250,12 +253,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if args.ConfigNum != kv.config.Num {
 		reply.Err = ErrWrongGroup
 		// log.Printf("wrong config num %d, now %d\n", args.ConfigNum, kv.config.Num)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	if kv.configChanging && kv.isForbbidenOpWhenConfigChanging(args.Key) {
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
@@ -264,7 +267,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if exist {
 			reply.Err = resp.Err
 			// log.Printf("group %d, server %d, num %d, shards:%+v, already finish request, args key:%s, shard:%d, reply:%+v， args%+v \n", kv.gid, kv.me, kv.config.Num, kv.currentShards, args.Key, key2shard(args.Key), reply, args)
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		}
 	}
@@ -282,25 +285,25 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 	kv.waitPutAppendReply(args, reply)
 }
 
 func (kv *ShardKV) waitShardsAddReply(args *ShardsAddArgs, reply *ShardsAddReply) {
 	for i := 0; i < 10; i++ {
-		kv.mu.Lock()
+		kv.mu.RLock()
 		rId, exist := kv.lastRequestId[args.ClientId]
 		if exist && rId == args.RequestId {
 			resp := kv.lastResponse[args.ClientId].Reply.(ShardsAddReply)
 			reply.Err = resp.Err
 			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		} else {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * 10)
 		}
 	}
@@ -308,17 +311,17 @@ func (kv *ShardKV) waitShardsAddReply(args *ShardsAddArgs, reply *ShardsAddReply
 
 func (kv *ShardKV) waitGetReply(args *GetArgs, reply *GetReply) {
 	for i := 0; i < 10; i++ {
-		kv.mu.Lock()
+		kv.mu.RLock()
 		rId, exist := kv.lastRequestId[args.ClientId]
 		if exist && rId == args.RequestId {
 			resp := kv.lastResponse[args.ClientId].Reply.(GetReply)
 			reply.Err = resp.Err
 			reply.Value = resp.Value
 			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		} else {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * 10)
 		}
 	}
@@ -326,16 +329,16 @@ func (kv *ShardKV) waitGetReply(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) waitShardsRemoveReply(args *ShardsRemoveArgs, reply *ShardsRemoveReply) {
 	for i := 0; i < 10; i++ {
-		kv.mu.Lock()
+		kv.mu.RLock()
 		rId, exist := kv.lastRequestId[args.ClientId]
 		if exist && rId == args.RequestId {
 			resp := kv.lastResponse[args.ClientId].Reply.(ShardsRemoveReply)
 			reply.Err = resp.Err
 			// log.Printf("leader:%d finsish %+v, reply %+v\n", kv.me, args, reply)
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		} else {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * 10)
 		}
 	}
@@ -343,17 +346,17 @@ func (kv *ShardKV) waitShardsRemoveReply(args *ShardsRemoveArgs, reply *ShardsRe
 
 func (kv *ShardKV) waitPutAppendReply(args *PutAppendArgs, reply *PutAppendReply) {
 	for i := 0; i < 10; i++ {
-		kv.mu.Lock()
+		kv.mu.RLock()
 		rId, exist := kv.lastRequestId[args.ClientId]
 		// log.Printf("server %d, lastRequestId %d, args.RequestId %d \n", kv.me, rId, args.RequestId)
 		if exist && rId == args.RequestId {
 			// log.Printf("server %d finished request %+v, reply %+v \n", kv.me, args, reply)
 			resp := kv.lastResponse[args.ClientId].Reply.(PutAppendReply)
 			reply.Err = resp.Err
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		} else {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * 10)
 		}
 	}
@@ -472,12 +475,45 @@ func (kv *ShardKV) getRaftSize() int {
 	return kv.logReplayOverheadBytes
 }
 
+func compressBytes(input []byte) ([]byte, error) {
+	var compressedData bytes.Buffer
+	writer := gzip.NewWriter(&compressedData)
+
+	_, err := writer.Write(input)
+	if err != nil {
+		return nil, err
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return compressedData.Bytes(), nil
+}
+
+func decompressBytes(compressedData []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(compressedData))
+	if err != nil {
+		return nil, err
+	}
+
+	decompressedData, err := ioutil.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	return decompressedData, nil
+}
+
 func (kv *ShardKV) readSnapshot(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
 	// Example:
+	data, _ = decompressBytes(data)
+
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
@@ -523,7 +559,9 @@ func (kv *ShardKV) getStateMachineBytes() []byte {
 	e.Encode(kv.configChanging)
 	e.Encode(kv.prevConfig)
 	e.Encode(kv.config)
-	return w.Bytes()
+	originBytes := w.Bytes()
+	res, _ := compressBytes(originBytes)
+	return res
 }
 
 func (kv *ShardKV) isForbbidenOpWhenConfigChanging(key string) bool {
@@ -569,6 +607,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
+		// op.Args = PutAppendArgs{}
 		op.Reply = reply
 	case MethodPut:
 		args := op.Args.(PutAppendArgs)
@@ -583,6 +622,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
+		// op.Args = PutAppendArgs{}
 		op.Reply = reply
 	case MethodGet:
 		args := op.Args.(GetArgs)
@@ -602,6 +642,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
+		// op.Args = GetArgs{}
 		op.Reply = reply
 	case MethodConfigChange:
 		args := op.Args.(ConfigChangeArgs)
@@ -633,13 +674,13 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 				args.ChangeFinish = true
 				op.Args = args
 				if _, isLeader := kv.rf.GetState(); isLeader {
-					log.Printf("group %d, server %d, num %d, command %d, config change begin, args: %+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args)
+					log.Printf("group %d, server %d, num %d, command %d, shards:%+v config change begin, args: num:%d, shards:%+v\n", kv.gid, kv.me, kv.prevConfig.Num, msg.CommandIndex, kv.prevConfig.Shards, kv.config.Num, kv.config.Shards)
 					log.Printf("group %d, server %d, num %d, command %d, config change finish, current shards: %+v \n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, kv.currentShards)
 				}
 			} else {
 				kv.configChanging = true
 				if _, isLeader := kv.rf.GetState(); isLeader {
-					log.Printf("group %d, server %d, num %d, command %d, config change begin, args: %+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args)
+					log.Printf("group %d, server %d, num %d, command %d, shards:%+v config change begin, args: num:%d, shards:%+v\n", kv.gid, kv.me, kv.prevConfig.Num, msg.CommandIndex, kv.prevConfig.Shards, kv.config.Num, kv.config.Shards)
 				}
 			}
 
@@ -672,15 +713,27 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		// 	switch arg := resp.Args.(type) {
 		// 	case GetArgs:
 		// 		shard := key2shard(arg.Key)
-		// 		_, exist := kv.currentShards[shard]
-		// 		if !exist {
+		// 		exist := false
+		// 		for i := 0; i < len(args.Shards); i++ {
+		// 			if shard == args.Shards[i] {
+		// 				exist = true
+		// 			}
+		// 		}
+		// 		if exist {
+		// 			resp.Args = GetArgs{}
 		// 			resp.Reply = GetReply{Err: ErrWrongGroup}
 		// 			kv.lastResponse[clientId] = resp
 		// 		}
 		// 	case PutAppendArgs:
 		// 		shard := key2shard(arg.Key)
-		// 		_, exist := kv.currentShards[shard]
-		// 		if !exist {
+		// 		exist := false
+		// 		for i := 0; i < len(args.Shards); i++ {
+		// 			if shard == args.Shards[i] {
+		// 				exist = true
+		// 			}
+		// 		}
+		// 		if exist {
+		// 			resp.Args = PutAppendArgs{}
 		// 			resp.Reply = PutAppendReply{Err: ErrWrongGroup}
 		// 			kv.lastResponse[clientId] = resp
 		// 		}
@@ -715,6 +768,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			log.Printf("group %d, leader %d, num: %d, command %d, receive shards: %+v, given:%+v, now:%+v, args:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args.Shards, kv.getGivenShards(), kv.currentShards, args)
 		}
+		op.Args = ShardsAddArgs{}
 		op.Reply = ShardsAddReply{Err: OK}
 	default:
 		log.Printf("warning: unknown command %+v\n", msg)
@@ -730,15 +784,15 @@ func (kv *ShardKV) configMaintainer() {
 			continue
 		}
 		nextConfig := kv.sm.Query(LatestConfig)
-		kv.mu.Lock()
+		kv.mu.RLock()
 		if _, isLeader := kv.rf.GetState(); !isLeader {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 			continue
 		}
 
 		if nextConfig.Num == kv.config.Num {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 			//	log.Printf("group %d, num %d, config is latest, nothing to update\n", kv.gid, kv.config.Num)
 			continue
@@ -748,7 +802,7 @@ func (kv *ShardKV) configMaintainer() {
 
 		if kv.configChanging {
 			//	log.Printf("group %d, server %d, waiting config change finish, num %d, current shards %+v \n", kv.gid, kv.me, kv.config.Num, kv.currentShards)
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			time.Sleep(time.Millisecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 			continue
 		}
@@ -775,7 +829,7 @@ func (kv *ShardKV) configMaintainer() {
 			// log.Printf("group %d, leader %d change config %+v\n", kv.gid, kv.me, nextConfig)
 			kv.rf.Start(configChangeOp)
 		}
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		time.Sleep(time.Millisecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 	}
 }
@@ -821,14 +875,20 @@ func (kv *ShardKV) shardsValid() bool {
 
 func (kv *ShardKV) configChangeRoutine() {
 	for {
-		kv.mu.Lock()
-		if !kv.configChanging {
-			kv.mu.Unlock()
+		if _, isLeader := kv.rf.GetState(); !isLeader {
 			time.Sleep(time.Microsecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 			continue
 		}
+
+		kv.mu.RLock()
 		if _, isLeader := kv.rf.GetState(); !isLeader {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
+			time.Sleep(time.Microsecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
+			continue
+		}
+
+		if !kv.configChanging {
+			kv.mu.RUnlock()
 			time.Sleep(time.Microsecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 			continue
 		}
@@ -851,7 +911,7 @@ func (kv *ShardKV) configChangeRoutine() {
 			}
 			kv.rf.Start(finishOp)
 		}
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		time.Sleep(time.Microsecond * CONFIG_POLLING_FIX_DELAY_MILLISECONDS)
 	}
 }
