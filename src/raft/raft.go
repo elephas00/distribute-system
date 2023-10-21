@@ -737,12 +737,12 @@ func (rf *Raft) doRequestVote(server int, getVotes *int, heartBeatSended *bool, 
 			*heartBeatSended = true
 			rf.convertToLeader()
 			go rf.sendAppendEntriesToFollowers()
-			// noOp := Log{
-			// 	Term:    rf.persistState.term,
-			// 	Index:   rf.getLastLogIndex() + 1,
-			// 	Command: nil,
-			// }
-			// rf.persistState.logs = append(rf.persistState.logs, noOp)
+			noOp := Log{
+				Term:    rf.persistState.term,
+				Index:   rf.getLastLogIndex() + 1,
+				Command: nil,
+			}
+			rf.persistState.logs = append(rf.persistState.logs, noOp)
 		}
 	}
 	rf.mu.Unlock()
