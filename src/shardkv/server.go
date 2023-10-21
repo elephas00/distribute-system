@@ -548,7 +548,7 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// data, _ = decompressBytes(data)
+	data, _ = decompressBytes(data)
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -595,10 +595,10 @@ func (kv *ShardKV) getStateMachineBytes() []byte {
 	e.Encode(kv.configChanging)
 	e.Encode(kv.prevConfig)
 	e.Encode(kv.config)
-	// originBytes := w.Bytes()
-	// res, _ := compressBytes(originBytes)
-	// return res
-	return w.Bytes()
+	originBytes := w.Bytes()
+	res, _ := compressBytes(originBytes)
+	return res
+	// return w.Bytes()
 }
 
 func (kv *ShardKV) isForbbidenOpWhenConfigChanging(key string) bool {
