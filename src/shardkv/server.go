@@ -545,7 +545,7 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	data, _ = decompressBytes(data)
+	// data, _ = decompressBytes(data)
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -592,9 +592,10 @@ func (kv *ShardKV) getStateMachineBytes() []byte {
 	e.Encode(kv.configChanging)
 	e.Encode(kv.prevConfig)
 	e.Encode(kv.config)
-	originBytes := w.Bytes()
-	res, _ := compressBytes(originBytes)
-	return res
+	// originBytes := w.Bytes()
+	// res, _ := compressBytes(originBytes)
+	// return res
+	return w.Bytes()
 }
 
 func (kv *ShardKV) isForbbidenOpWhenConfigChanging(key string) bool {
@@ -640,7 +641,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
-		// op.Args = PutAppendArgs{}
+		op.Args = PutAppendArgs{Key: string(args.Key[0])}
 		op.Reply = reply
 	case MethodPut:
 		args := op.Args.(PutAppendArgs)
@@ -655,7 +656,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
-		// op.Args = PutAppendArgs{}
+		op.Args = PutAppendArgs{Key: string(args.Key[0])}
 		op.Reply = reply
 	case MethodGet:
 		args := op.Args.(GetArgs)
@@ -675,7 +676,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
-		// op.Args = GetArgs{}
+		op.Args = GetArgs{Key: string(args.Key[0])}
 		op.Reply = reply
 	case MethodConfigChange:
 		args := op.Args.(ConfigChangeArgs)
@@ -703,19 +704,8 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 			}
 			kv.prevConfig = kv.config
 			kv.config = args.Config
-			if kv.shardsValid() {
-				args.ChangeFinish = true
-				op.Args = args
-				if _, isLeader := kv.rf.GetState(); isLeader {
-					log.Printf("group %d, server %d, num %d, command %d, shards:%+v config change begin, args: num:%d, shards:%+v\n", kv.gid, kv.me, kv.prevConfig.Num, msg.CommandIndex, kv.prevConfig.Shards, kv.config.Num, kv.config.Shards)
-					log.Printf("group %d, server %d, num %d, command %d, config change finish, current shards: %+v \n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, kv.currentShards)
-				}
-			} else {
-				kv.configChanging = true
-				if _, isLeader := kv.rf.GetState(); isLeader {
-					log.Printf("group %d, server %d, num %d, command %d, shards:%+v config change begin, args: num:%d, shards:%+v\n", kv.gid, kv.me, kv.prevConfig.Num, msg.CommandIndex, kv.prevConfig.Shards, kv.config.Num, kv.config.Shards)
-				}
-			}
+			kv.configChanging = true
+			log.Printf("group %d, server %d, num %d, command %d, shards:%+v config change begin, args: num:%d, shards:%+v\n", kv.gid, kv.me, kv.prevConfig.Num, msg.CommandIndex, kv.prevConfig.Shards, kv.config.Num, kv.config.Shards)
 
 		} else {
 			kv.configChanging = false
@@ -742,37 +732,6 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 				delete(kv.stateMachine, k)
 			}
 		}
-		// for clientId, resp := range kv.lastResponse {
-		// 	switch arg := resp.Args.(type) {
-		// 	case GetArgs:
-		// 		shard := key2shard(arg.Key)
-		// 		exist := false
-		// 		for i := 0; i < len(args.Shards); i++ {
-		// 			if shard == args.Shards[i] {
-		// 				exist = true
-		// 			}
-		// 		}
-		// 		if exist {
-		// 			resp.Args = GetArgs{}
-		// 			resp.Reply = GetReply{Err: ErrWrongGroup}
-		// 			kv.lastResponse[clientId] = resp
-		// 		}
-		// 	case PutAppendArgs:
-		// 		shard := key2shard(arg.Key)
-		// 		exist := false
-		// 		for i := 0; i < len(args.Shards); i++ {
-		// 			if shard == args.Shards[i] {
-		// 				exist = true
-		// 			}
-		// 		}
-		// 		if exist {
-		// 			resp.Args = PutAppendArgs{}
-		// 			resp.Reply = PutAppendReply{Err: ErrWrongGroup}
-		// 			kv.lastResponse[clientId] = resp
-		// 		}
-		// 	}
-		// }
-
 		if kv.maxraftstate != NO_SNAPSHOT {
 			stateMachineState := kv.getStateMachineBytes()
 			kv.rf.Snapshot(msg.CommandIndex, stateMachineState)
@@ -782,6 +741,7 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			log.Printf("group %d, leader %d, num: %d, command %d, remove shards: %+v, given:%+v, now:%+v, args:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args.Shards, kv.getGivenShards(), kv.currentShards, args)
 		}
+		op.Args = ShardsRemoveArgs{}
 		op.Reply = ShardsRemoveReply{Err: OK}
 	case MethodAddShards:
 		args := op.Args.(ShardsAddArgs)
