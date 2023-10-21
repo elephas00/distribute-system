@@ -57,7 +57,6 @@ type ConfigChangeArgs struct {
 	ClientId     int
 	RequestId    int
 	Config       shardctrler.Config
-	PrevConfig   shardctrler.Config
 	ChangeFinish bool
 }
 
