@@ -27,6 +27,7 @@ type Op struct {
 	ClientId  int
 	RequestId int
 	Method    string
+	Shard     int
 	Args      interface{}
 	Reply     interface{}
 }
@@ -229,6 +230,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 		Method:    MethodGet,
+		Shard:     key2shard(args.Key),
 		Args:      *args,
 	}
 
@@ -298,6 +300,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	putAppendOp := Op{
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
+		Shard:     key2shard(args.Key),
 		Args:      *args,
 	}
 	if args.Op == MethodPut {
@@ -435,7 +438,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(ShardsRemoveReply{})
 	labgob.Register(ConfigChangeArgs{})
 	labgob.Register(ConfigChangeReply{})
-
+	labgob.Register(void{})
 	kv := new(ShardKV)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -641,7 +644,6 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
-		op.Args = PutAppendArgs{Key: string(args.Key[0])}
 		op.Reply = reply
 	case MethodPut:
 		args := op.Args.(PutAppendArgs)
@@ -656,7 +658,6 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
-		op.Args = PutAppendArgs{Key: string(args.Key[0])}
 		op.Reply = reply
 	case MethodGet:
 		args := op.Args.(GetArgs)
@@ -676,7 +677,6 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		} else {
 			reply.Err = ErrWrongGroup
 		}
-		op.Args = GetArgs{Key: string(args.Key[0])}
 		op.Reply = reply
 	case MethodConfigChange:
 		args := op.Args.(ConfigChangeArgs)
@@ -732,6 +732,20 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 				delete(kv.stateMachine, k)
 			}
 		}
+		shardsMap := make([]bool, shardctrler.NShards)
+		for _, shard := range args.Shards {
+			shardsMap[shard] = true
+		}
+		for clientId, resp := range kv.lastResponse {
+			switch resp.Method {
+			case MethodGet, MethodPut, MethodAppend:
+				if shardsMap[resp.Shard] {
+					delete(kv.lastRequestId, clientId)
+					delete(kv.lastResponse, clientId)
+				}
+			}
+		}
+
 		if kv.maxraftstate != NO_SNAPSHOT {
 			stateMachineState := kv.getStateMachineBytes()
 			kv.rf.Snapshot(msg.CommandIndex, stateMachineState)
@@ -741,7 +755,6 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			log.Printf("group %d, leader %d, num: %d, command %d, remove shards: %+v, given:%+v, now:%+v, args:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args.Shards, kv.getGivenShards(), kv.currentShards, args)
 		}
-		op.Args = ShardsRemoveArgs{}
 		op.Reply = ShardsRemoveReply{Err: OK}
 	case MethodAddShards:
 		args := op.Args.(ShardsAddArgs)
@@ -761,11 +774,11 @@ func (kv *ShardKV) applyMsg(msg *raft.ApplyMsg) {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			log.Printf("group %d, leader %d, num: %d, command %d, receive shards: %+v, given:%+v, now:%+v, args:%+v\n", kv.gid, kv.me, kv.config.Num, msg.CommandIndex, args.Shards, kv.getGivenShards(), kv.currentShards, args)
 		}
-		op.Args = ShardsAddArgs{}
 		op.Reply = ShardsAddReply{Err: OK}
 	default:
 		log.Printf("warning: unknown command %+v\n", msg)
 	}
+	op.Args = VOID_MEMEBER
 	kv.lastRequestId[op.ClientId] = op.RequestId
 	kv.lastResponse[op.ClientId] = op
 }
@@ -932,28 +945,12 @@ func (kv *ShardKV) prepareMoveoutKeyValueData(shards []int) map[string]string {
 func (kv *ShardKV) prepareMoveoutResponseData(shards []int) map[int]Op {
 	lastResponse := make(map[int]Op)
 	for clientId, resp := range kv.lastResponse {
-		switch args := resp.Args.(type) {
-		case GetArgs:
-			shard := key2shard(args.Key)
-			find := false
+		switch resp.Method {
+		case MethodGet, MethodPut, MethodAppend:
 			for i := 0; i < len(shards); i++ {
-				if shards[i] == shard {
-					find = true
+				if shards[i] == resp.Shard {
+					lastResponse[clientId] = resp
 				}
-			}
-			if find {
-				lastResponse[clientId] = resp
-			}
-		case PutAppendArgs:
-			shard := key2shard(args.Key)
-			find := false
-			for i := 0; i < len(shards); i++ {
-				if shards[i] == shard {
-					find = true
-				}
-			}
-			if find {
-				lastResponse[clientId] = resp
 			}
 		}
 	}
